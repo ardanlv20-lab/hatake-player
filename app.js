@@ -18,16 +18,22 @@ function getDuration(blob){return new Promise(res=>{const a=new Audio();const u=
  a.preload='metadata';a.onloadedmetadata=()=>done(a.duration);a.onerror=()=>done(0);setTimeout(()=>done(0),8000);a.src=u})}
 
 async function addFiles(files){
- let n=0;
+ let n=0,ok=0;
  for(const f of files){
   msg('取り込み中… '+(++n)+'/'+files.length+' '+f.name);
-  const blob=new Blob([await f.arrayBuffer()],{type:f.type||'audio/mpeg'});
+  const ext=(f.name.split('.').pop()||'').toLowerCase();
+  const types={mp3:'audio/mpeg',m4a:'audio/mp4',aac:'audio/aac',wav:'audio/wav',mp4:'audio/mp4',caf:'audio/x-caf',aif:'audio/aiff',aiff:'audio/aiff',flac:'audio/flac',ogg:'audio/ogg',opus:'audio/ogg'};
+  if(!(f.type||'').startsWith('audio/')&&!types[ext]){msg('音楽ファイルではないのでスキップ: '+f.name);continue}
+  let buf;try{buf=await f.arrayBuffer()}catch(e){msg('読み込めませんでした（iCloudにあるファイルは先にダウンロードしてください）: '+f.name);continue}
+  const type=(f.type&&f.type.startsWith('audio/'))?f.type:(types[ext]||'audio/mpeg');
+  const blob=new Blob([buf],{type});
   const id=Date.now().toString(36)+Math.random().toString(36).slice(2,7);
   const meta={id,title:f.name.replace(/\.[^.]+$/,''),duration:await getDuration(blob),size:blob.size,added:Date.now()};
-  try{await tx('blobs','readwrite',s=>s.put(blob,id));await tx('meta','readwrite',s=>s.put(meta));songs.push(meta)}
-  catch(e){msg('保存できませんでした（容量不足の可能性）: '+f.name);break}
+  try{await tx('blobs','readwrite',s=>s.put({buf,type},id));await tx('meta','readwrite',s=>s.put(meta));songs.push(meta)}
+  catch(e){msg('保存できませんでした: '+f.name+'（'+(e&&e.name||e)+'）');ok=-1;break}
+  ok++;
  }
- msg(n+'曲を取り込みました');render();usage();makeOrder();
+ if(ok>=0)msg(ok+'曲を取り込みました');render();usage();makeOrder();
  if(cur<0&&songs.length)load(0,false);
 }
 async function del(i){
@@ -55,7 +61,7 @@ function makeOrder(){order=songs.map((_,i)=>i);if(S.shuffle)for(let i=order.leng
 async function load(i,play,pos){
  if(i<0||i>=songs.length)return;cur=i;const s=songs[i];
  const blob=await tx('blobs','readonly',st=>st.get(s.id));
- if(urlNow)URL.revokeObjectURL(urlNow);urlNow=URL.createObjectURL(blob);
+ if(urlNow)URL.revokeObjectURL(urlNow);urlNow=URL.createObjectURL(blob instanceof Blob?blob:new Blob([blob.buf],{type:blob.type}));
  audio.src=urlNow;$('title').textContent=s.title;$('seek').max=Math.floor(s.duration)||0;$('dur').textContent=fmt(s.duration);
  if(pos)audio.addEventListener('loadedmetadata',()=>{audio.currentTime=pos},{once:true});
  S.lastId=s.id;S.lastPos=pos||0;save();render();session(s);
