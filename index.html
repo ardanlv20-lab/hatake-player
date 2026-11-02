@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="畑プレーヤー">
+<meta name="theme-color" content="#000000">
+<title>畑プレーヤー</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<style>
+:root{--bg:#fff;--fg:#000;--acc:#ffd400;--sub:#e8e8e8;--bd:#000}
+body.dark{--bg:#000;--fg:#fff;--acc:#ffd400;--sub:#222;--bd:#fff}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--fg);font:bold 20px/1.4 -apple-system,"Hiragino Sans",sans-serif;padding:env(safe-area-inset-top) 12px calc(env(safe-area-inset-bottom) + 12px)}
+h1{font-size:22px;margin:10px 0;display:flex;justify-content:space-between;align-items:center}
+button,.btn{font:inherit;color:var(--fg);background:var(--sub);border:3px solid var(--bd);border-radius:14px;min-height:64px;min-width:64px;cursor:pointer}
+button.on{background:var(--acc);color:#000}
+#now{border:3px solid var(--bd);border-radius:16px;padding:12px;margin-bottom:12px}
+#title{font-size:24px;min-height:34px;word-break:break-all}
+#seek{width:100%;height:48px;accent-color:#e00}
+#times{display:flex;justify-content:space-between;font-size:18px}
+.row{display:flex;gap:10px;margin-top:10px}
+.row button{flex:1}
+#play{flex:1.6;font-size:40px;min-height:96px;background:var(--acc);color:#000}
+#ctrl button{font-size:32px;min-height:96px}
+#add{display:block;text-align:center;line-height:58px;margin:12px 0;background:var(--acc);color:#000}
+#file{display:none}
+ul{list-style:none;padding:0;margin:0}
+li{display:flex;align-items:center;gap:8px;border-bottom:2px solid var(--sub);padding:6px 0}
+li .t{flex:1;padding:10px 4px;word-break:break-all;cursor:pointer}
+li.cur .t{color:#c00}
+body.dark li.cur .t{color:var(--acc)}
+li button{min-height:56px;min-width:56px;font-size:20px}
+#usage{font-size:16px;margin:8px 0}
+#msg{font-size:16px;min-height:22px}
+</style>
+</head>
+<body>
+<h1>🎵 畑プレーヤー <button id="dark" aria-label="表示切替">🌙</button></h1>
+<div id="now">
+  <div id="title">曲を追加してください</div>
+  <input id="seek" type="range" min="0" max="0" step="1" value="0" aria-label="再生位置">
+  <div id="times"><span id="cur">0:00</span><span id="dur">0:00</span></div>
+  <div class="row" id="ctrl">
+    <button id="prev" aria-label="前の曲">⏮</button>
+    <button id="play" aria-label="再生">▶</button>
+    <button id="next" aria-label="次の曲">⏭</button>
+  </div>
+  <div class="row">
+    <button id="shuffle">🔀 シャッフル</button>
+    <button id="repeat">🔁 リピートなし</button>
+  </div>
+</div>
+<label class="btn" id="add">＋ 曲を追加（ファイルから）<input id="file" type="file" accept="audio/*" multiple></label>
+<div id="msg"></div>
+<div id="usage"></div>
+<ul id="list"></ul>
+<audio id="audio" preload="auto" playsinline></audio>
+<script src="app.js"></script>
+</body>
+</html>
