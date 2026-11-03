@@ -204,13 +204,28 @@ document.addEventListener('visibilitychange',()=>{
  if(audio.paused)audio.play().catch(()=>{});
 });
 
+const APP_VERSION='v5';
+$('update').onclick=async()=>{
+ if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
+ msg('更新中…');
+ try{if('serviceWorker' in navigator)for(const r of await navigator.serviceWorker.getRegistrations())await r.unregister();
+  if(window.caches)for(const k of await caches.keys())if(k.startsWith('hatake-player-'))await caches.delete(k)}catch(e){}
+ location.replace(location.pathname+'?u='+Date.now());
+};
 (async()=>{
- ui();db=await openDB();
+ ui();$('ver').textContent=APP_VERSION;db=await openDB();
  songs=(await tx('meta','readonly',s=>s.getAll())).sort((a,b)=>a.added-b.added);
  makeOrder();render();usage();
  if(navigator.storage&&navigator.storage.persist)navigator.storage.persist().then(p=>{window.__persisted=p});
  const i=songs.findIndex(s=>s.id===S.lastId);
  if(i>=0)await load(i,false,S.lastPos);else if(songs.length)await load(0,false);
- if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(e=>console.warn(e));
+ if('serviceWorker' in navigator){
+  const had=!!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener('controllerchange',()=>{
+   if(!had)return;const k='hp-reloaded',t=+sessionStorage.getItem(k)||0;
+   if(Date.now()-t<30000)return;sessionStorage.setItem(k,Date.now());location.reload()});
+  navigator.serviceWorker.register('sw.js',{updateViaCache:'none'}).then(r=>{window.__reg=r;r.update().catch(()=>{})}).catch(e=>console.warn(e));
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden&&window.__reg)window.__reg.update().catch(()=>{})});
+ }
  window.__ready=true;
 })();
