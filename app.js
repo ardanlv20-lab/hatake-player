@@ -33,7 +33,7 @@ async function addFiles(files){
   catch(e){msg('保存できませんでした: '+f.name+'（'+(e&&e.name||e)+'）');ok=-1;break}
   ok++;
  }
- if(ok>=0)msg(ok+'曲を取り込みました');render();usage();makeOrder();
+ if(ok>=0)msg(ok+'曲を取り込みました');render();usage();makeOrder();prefetch();
  if(cur<0&&songs.length)load(0,false);
 }
 async function del(i){
@@ -42,7 +42,7 @@ async function del(i){
  const wasCur=i===cur;songs.splice(i,1);
  if(wasCur){audio.pause();audio.removeAttribute('src');cur=-1;if(songs.length)load(Math.min(i,songs.length-1),false);else $('title').textContent='曲を追加してください'}
  else if(i<cur)cur--;
- makeOrder();render();usage();
+ makeOrder();render();usage();dropPre();prefetch();
 }
 function render(){
  const ul=$('list');ul.innerHTML='';
@@ -58,28 +58,62 @@ async function usage(){
  $('usage').textContent=t;
 }
 function makeOrder(){order=songs.map((_,i)=>i);if(S.shuffle)for(let i=order.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[order[i],order[j]]=[order[j],order[i]]}}
-async function load(i,play,pos){
- if(i<0||i>=songs.length)return;cur=i;const s=songs[i];
- const blob=await tx('blobs','readonly',st=>st.get(s.id));
- if(urlNow)URL.revokeObjectURL(urlNow);urlNow=URL.createObjectURL(blob instanceof Blob?blob:new Blob([blob.buf],{type:blob.type}));
- audio.src=urlNow;$('title').textContent=s.title;$('seek').max=Math.floor(s.duration)||0;$('dur').textContent=fmt(s.duration);
+let pre=null,pendingOrder=null;
+const toBlob=blob=>blob instanceof Blob?blob:new Blob([blob.buf],{type:blob.type});
+function nextIdx(){
+ if(!songs.length)return -1;pendingOrder=null;
+ const k=order.indexOf(cur)+1;
+ if(k<order.length)return order[k];
+ if(S.repeat!=='all')return -1;
+ if(S.shuffle){const o=songs.map((_,i)=>i);for(let i=o.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[o[i],o[j]]=[o[j],o[i]]}pendingOrder=o;return o[0]}
+ return order[0];
+}
+function dropPre(){if(pre){if(pre.url&&pre.url!==urlNow)URL.revokeObjectURL(pre.url);pre=null}}
+async function prefetch(){
+ const n=nextIdx();
+ if(pre&&pre.i===n&&pre.id===(songs[n]||{}).id)return;
+ dropPre();if(n<0)return;
+ const tok=pre={i:n,id:songs[n].id,url:null};
+ try{const blob=await tx('blobs','readonly',st=>st.get(tok.id));
+  if(pre!==tok||!blob)return;tok.url=URL.createObjectURL(toBlob(blob))}catch(e){if(pre===tok)pre=null}
+}
+function apply(i,url,play,pos){
+ const old=urlNow;cur=i;const s=songs[i];urlNow=url;
+ audio.src=url;if(play){const p=audio.play();if(p&&p.catch)p.catch(()=>{})}
+ if(old&&old!==url)URL.revokeObjectURL(old);
+ if(pendingOrder&&pendingOrder[0]===i){order=pendingOrder;pendingOrder=null}
+ $('title').textContent=s.title;$('seek').max=Math.floor(s.duration)||0;$('dur').textContent=fmt(s.duration);
  if(pos)audio.addEventListener('loadedmetadata',()=>{audio.currentTime=pos},{once:true});
  S.lastId=s.id;S.lastPos=pos||0;save();render();session(s);
- if(play)audio.play().catch(()=>{});
+ setTimeout(prefetch,0);
+}
+async function load(i,play,pos){
+ if(i<0||i>=songs.length)return;
+ if(pre&&pre.i===i&&pre.url&&pre.id===songs[i].id){const u=pre.url;pre=null;apply(i,u,play,pos);return}
+ const s=songs[i];const blob=await tx('blobs','readonly',st=>st.get(s.id));
+ apply(i,URL.createObjectURL(toBlob(blob)),play,pos);
 }
 function step(d){
  if(!songs.length)return;
+ if(d>0){const n=nextIdx();if(n<0){audio.pause();return}load(n,true);return}
  let k=order.indexOf(cur)+d;
- if(k>=order.length){if(S.repeat==='all'){if(S.shuffle)makeOrder();k=0}else{audio.pause();return}}
  if(k<0)k=S.repeat==='all'?order.length-1:0;
  load(order[k],true);
 }
+function onEnded(){
+ if(S.repeat==='one'){audio.currentTime=0;audio.play().catch(()=>{});return}
+ const n=nextIdx();if(n<0){audio.pause();return}
+ if(pre&&pre.i===n&&pre.url&&pre.id===songs[n].id){const u=pre.url;pre=null;apply(n,u,true);return}
+ load(n,true);
+}
+function posState(){if('mediaSession' in navigator&&navigator.mediaSession.setPositionState&&audio.duration&&isFinite(audio.duration)){
+ try{navigator.mediaSession.setPositionState({duration:audio.duration,playbackRate:audio.playbackRate||1,position:Math.min(audio.currentTime,audio.duration)})}catch(e){}}}
 function session(s){if(!('mediaSession' in navigator))return;
  navigator.mediaSession.metadata=new MediaMetadata({title:s.title,artist:'畑プレーヤー',artwork:[{src:'icon-512.png',sizes:'512x512',type:'image/png'}]});
 }
 if('mediaSession' in navigator){const m=navigator.mediaSession,h=(a,f)=>{try{m.setActionHandler(a,f)}catch(e){}};
- h('play',()=>audio.play());h('pause',()=>audio.pause());h('previoustrack',()=>step(-1));h('nexttrack',()=>step(1));
- h('seekto',e=>{audio.currentTime=e.seekTime});}
+ h('play',()=>{if(cur<0&&songs.length)load(order[0]??0,true);else audio.play().catch(()=>{})});h('pause',()=>audio.pause());h('stop',()=>audio.pause());h('previoustrack',()=>step(-1));h('nexttrack',()=>step(1));
+ h('seekto',e=>{audio.currentTime=e.seekTime;posState()});h('seekbackward',e=>{audio.currentTime=Math.max(0,audio.currentTime-(e.seekOffset||10));posState()});h('seekforward',e=>{audio.currentTime=Math.min(audio.duration||0,audio.currentTime+(e.seekOffset||10));posState()});}
 function ui(){
  $('shuffle').classList.toggle('on',S.shuffle);
  $('repeat').classList.toggle('on',S.repeat!=='none');
@@ -90,18 +124,18 @@ function ui(){
 $('play').onclick=()=>{if(cur<0){if(songs.length)load(order[0]??0,true);return}audio.paused?audio.play():audio.pause()};
 $('prev').onclick=()=>{if(audio.currentTime>3)audio.currentTime=0;else step(-1)};
 $('next').onclick=()=>step(1);
-$('shuffle').onclick=()=>{S.shuffle=!S.shuffle;makeOrder();save();ui()};
-$('repeat').onclick=()=>{S.repeat={none:'all',all:'one',one:'none'}[S.repeat];save();ui()};
+$('shuffle').onclick=()=>{S.shuffle=!S.shuffle;makeOrder();save();ui();prefetch()};
+$('repeat').onclick=()=>{S.repeat={none:'all',all:'one',one:'none'}[S.repeat];save();ui();prefetch()};
 $('dark').onclick=()=>{S.dark=!S.dark;save();ui()};
 $('file').onchange=e=>{const f=[...e.target.files];e.target.value='';if(f.length)addFiles(f)};
 $('seek').oninput=e=>{audio.currentTime=+e.target.value};
 audio.onplay=()=>{$('play').textContent='⏸';$('play').setAttribute('aria-label','一時停止');if('mediaSession' in navigator)navigator.mediaSession.playbackState='playing'};
 audio.onpause=()=>{$('play').textContent='▶';$('play').setAttribute('aria-label','再生');S.lastPos=audio.currentTime;save();if('mediaSession' in navigator)navigator.mediaSession.playbackState='paused'};
-audio.onended=()=>step(1);
+audio.onended=onEnded;audio.addEventListener('loadedmetadata',posState);audio.addEventListener('ratechange',posState);
 let lastSave=0;
 audio.ontimeupdate=()=>{$('cur').textContent=fmt(audio.currentTime);$('seek').value=Math.floor(audio.currentTime);
  if(audio.duration&&isFinite(audio.duration)){$('seek').max=Math.floor(audio.duration);$('dur').textContent=fmt(audio.duration)}
- const n=Date.now();if(n-lastSave>3000){lastSave=n;S.lastPos=audio.currentTime;save()}};
+ const n=Date.now();if(n-lastSave>3000){lastSave=n;posState();S.lastPos=audio.currentTime;save()}};
 document.addEventListener('visibilitychange',()=>{if(document.hidden&&cur>=0){S.lastPos=audio.currentTime;save()}});
 
 (async()=>{
