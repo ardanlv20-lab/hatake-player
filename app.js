@@ -204,7 +204,7 @@ document.addEventListener('visibilitychange',()=>{
  if(audio.paused)audio.play().catch(()=>{});
 });
 
-const APP_VERSION='v5';
+const APP_VERSION='v6';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');
