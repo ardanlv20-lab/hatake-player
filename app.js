@@ -16,6 +16,10 @@ const S=Object.assign({shuffle:false,repeat:'none',dark:false,lastId:null,lastPo
 const save=()=>localStorage.setItem('hp-settings',JSON.stringify(S));
 const fmt=s=>{s=Math.floor(s||0);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
 const msg=t=>{$('msg').textContent=t};
+function idleScreen(){
+ $('title').textContent=songs.length?'曲を選んでください':'曲を追加してください';
+ $('seek').max=0;$('seek').value=0;$('cur').textContent=fmt(0);$('dur').textContent=fmt(0);
+}
 
 function openDB(){return new Promise((res,rej)=>{const r=indexedDB.open('hatake-player',1);
  r.onupgradeneeded=()=>{const d=r.result;d.createObjectStore('meta',{keyPath:'id'});d.createObjectStore('blobs')};
@@ -50,7 +54,7 @@ async function del(i){
  const s=songs[i];if(!confirm('「'+s.title+'」を削除しますか？'))return;
  await tx('blobs','readwrite',st=>st.delete(s.id));await tx('meta','readwrite',st=>st.delete(s.id));
  const wasCur=i===cur;songs.splice(i,1);
- if(wasCur){pausePlayback();audio.removeAttribute('src');cur=-1;if(songs.length)load(Math.min(i,songs.length-1),false);else $('title').textContent='曲を追加してください'}
+ if(wasCur){pausePlayback();audio.removeAttribute('src');cur=-1;if(songs.length)load(Math.min(i,songs.length-1),false);else idleScreen()}
  else if(i<cur)cur--;
  makeOrder();render();usage();dropPre();if(C&&!wasCur)rebuild();else prefetch();
 }
@@ -223,6 +227,7 @@ async function load(i,play=false,pos=0){
 }
 function step(d){
  if(!songs.length)return;
+ if(cur<0){msg('曲を選んでください');return}
  if(C){let n=segIdx+d;if(C.loop)n=(n+C.segs.length)%C.segs.length;
   if(n>=0&&n<C.segs.length){seekAbs(C.segs[n].start+0.01);setSeg(n);startAudio();return}
   if(n<0){seekAbs(C.segs[0].start);return}
@@ -269,6 +274,9 @@ function pausePlayback(){
  if(!loadJob){S.lastPos=rel();save()}playbackState('paused');
 }
 function startAudio(recover=true){
+ if(cur<0&&!loadJob&&!initializing){
+  wantPlay=false;userPaused=true;msg(songs.length?'曲を選んでください':'曲を追加してください');return Promise.resolve();
+ }
  if(initializing||loadJob||!audio.getAttribute('src')||cur<0){
   wantPlay=true;userPaused=false;msg('読み込み中… 再生を予約しました');return Promise.resolve();
  }
@@ -371,7 +379,7 @@ document.addEventListener('visibilitychange',()=>{
 
 window.addEventListener('pagehide',()=>{if(cur>=0&&!loadJob){S.lastPos=rel();save();posState()}});
 
-const APP_VERSION='v9';
+const APP_VERSION='v10';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');
@@ -384,9 +392,9 @@ $('update').onclick=async()=>{
  songs=(await tx('meta','readonly',s=>s.getAll())).sort((a,b)=>a.added-b.added);
  makeOrder();render();usage();
  if(navigator.storage&&navigator.storage.persist)navigator.storage.persist().then(p=>{window.__persisted=p});
- const i=songs.findIndex(s=>s.id===S.lastId);
- if(i>=0)await load(i,false,S.lastPos);else if(songs.length)await load(0,false);else msg('');
- initializing=false;if(wantPlay&&songs.length&&!loadJob){wantPlay=false;startAudio()}
+ idleScreen();msg('');
+ initializing=false;
+ if(wantPlay){wantPlay=false;userPaused=true;if(songs.length)msg('曲を選んでください')}
  if('serviceWorker' in navigator){
   const had=!!navigator.serviceWorker.controller;
   navigator.serviceWorker.addEventListener('controllerchange',()=>{

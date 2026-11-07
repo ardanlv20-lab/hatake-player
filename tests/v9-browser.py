@@ -41,8 +41,14 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.evaluate('pausePlayback()')
     page.reload();page.wait_for_function('window.__ready && !loadJob')
     page.evaluate("""() => {
-      if(cur!==1||Math.abs(audio.currentTime-3.25)>0.05||!audio.paused||playCalls.length)throw Error('Paused startup restore failed');
-      if(document.getElementById('title').textContent!=='song-2')throw Error('Wrong restored title');
+      if(cur!==-1||!audio.paused||playCalls.length)throw Error('Startup should stay idle');
+      if(document.getElementById('title').textContent!=='曲を選んでください')throw Error('Wrong idle title');
+      if(audio.getAttribute('src'))throw Error('Startup loaded audio');
+    }""")
+    page.evaluate('load(1,false,3.25)')
+    page.wait_for_function('cur===1 && !loadJob && Math.abs(audio.currentTime-3.25)<0.05')
+    page.evaluate("""() => {
+      if(document.getElementById('title').textContent!=='song-2')throw Error('Wrong loaded title');
       if(C.segs[0].id!==songs[1].id)throw Error('Wrong chunk start');
     }""")
     # Metadata is already present: no new loadedmetadata event should be necessary.
@@ -54,10 +60,12 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
       pausePlayback();playCalls=[];
       seekAbs(3.25);pausePlayback();sessionStorage.setItem('holdBuild','yes');
     }""")
-    page.reload();page.wait_for_function('loadJob && cur===-1')
+    page.reload();page.wait_for_function('window.__ready && !loadJob && cur===-1')
+    page.evaluate('() => { load(1,false,3.25) }')
+    page.wait_for_function('loadJob')
     page.evaluate("""() => {
       if(document.getElementById('title').textContent!=='song-2')throw Error('No loading title');
-      // Force an order different from the restored song to catch the old recovery bug.
+      // Force an order different from the selected song to catch the old recovery bug.
       order=[0,1,2,3,4,5];window.restoreGeneration=building;
     }""")
     page.locator('#play').click()
@@ -78,8 +86,8 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
       seekAbs(3.25);pausePlayback();
     }""")
     # Cancelling a queued request must not auto-play after restoration.
-    page.reload();page.wait_for_function('loadJob && cur===-1')
-    page.evaluate('startAudio();pausePlayback();__releaseBuild()')
+    page.reload();page.wait_for_function('window.__ready && !loadJob && cur===-1')
+    page.evaluate('load(1,false,3.25);startAudio();pausePlayback();__releaseBuild()')
     page.wait_for_function('window.__ready && !loadJob')
     page.evaluate("if(!audio.paused||wantPlay||playCalls.length)throw Error('Queued pause was ignored')")
     # A newer explicit selection supersedes an older build without stale callbacks.
@@ -101,8 +109,8 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
       if(newer)await newer;
       if(loadJob||cur!==2||Math.abs(audio.currentTime-2)>0.05)throw Error('Stale metadata seek escaped cancellation');
     }""")
-    assert page.locator('#ver').inner_text()=='v9'
+    assert page.locator('#ver').inner_text()=='v10'
     assert not errors,errors
-    print('PASS v9: paused song-2 restore, metadata-already-ready seek, early play stays queued, no recovery/cancellation, seek-before-first-play, queue cancellation, newer-load ownership, retained src, no page errors')
+    print('PASS v10: idle startup, metadata-already-ready seek, early play stays queued, no recovery/cancellation, seek-before-first-play, queue cancellation, newer-load ownership, retained src, no page errors')
     browser.close()
 server.shutdown()

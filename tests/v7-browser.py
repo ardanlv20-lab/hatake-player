@@ -79,14 +79,19 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.evaluate('navigator.serviceWorker.ready')
     context.set_offline(True)
     page.reload()
-    page.wait_for_function('window.__ready')
-    page.wait_for_function('audio.readyState>=1 && audio.currentTime>=9')
+    page.wait_for_function('window.__ready && !loadJob')
+    page.evaluate("""() => {
+      if(cur!==-1||document.getElementById('title').textContent!=='曲を選んでください')throw Error('Startup restored a song');
+      if(!audio.paused)throw Error('Startup started playback');
+    }""")
     assert page.locator('#ver').inner_text()==re.search(r"APP_VERSION='([^']+)'", (root/'app.js').read_text())[1]
     assert page.locator('#list li').count()==2
     page.evaluate("""() => {
       if(audio!==document.querySelector('audio')||document.querySelectorAll('audio').length!==1)throw Error('Multiple audio elements');
       if(!audio.playsInline||audio.preload!=='auto')throw Error('Audio configuration');
-      actions.play();
+      startAudio();
+      if(document.getElementById('msg').textContent!=='曲を選んでください')throw Error('Play without selection');
+      load(0,true);
     }""")
     page.wait_for_function("!audio.paused && navigator.mediaSession.playbackState==='playing'")
     assert not errors, errors
