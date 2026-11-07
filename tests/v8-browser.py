@@ -1,5 +1,5 @@
 """Regression: python3 tests/v8-browser.py (requires playwright/Chromium and ffmpeg)."""
-import functools, http.server, pathlib, subprocess, tempfile, threading
+import functools, http.server, pathlib, re, subprocess, tempfile, threading
 from playwright.sync_api import sync_playwright
 
 root=pathlib.Path(__file__).resolve().parents[1]
@@ -82,7 +82,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
         page.evaluate('navigator.serviceWorker.ready')
         context.set_offline(True);page.reload();page.wait_for_function('window.__ready')
         assert page.locator('#list li').count()==3
-        assert page.locator('#ver').inner_text()=='v8'
+        assert page.locator('#ver').inner_text()==re.search(r"APP_VERSION='([^']+)'", (root/'app.js').read_text())[1]
         assert not errors,errors
         print(f'PASS MPEG fixture {rate}Hz / {channels}ch: {info}; ticker, timeupdate, position state, pause, offline')
         context.close()
