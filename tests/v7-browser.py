@@ -2,7 +2,7 @@
 Uses a temporary localhost server, generated fixtures (ffmpeg), isolated Chromium profile.
 Does not reproduce iOS Control Center / OS process termination.
 """
-import functools, http.server, pathlib, subprocess, tempfile, threading
+import functools, http.server, pathlib, re, subprocess, tempfile, threading
 from playwright.sync_api import sync_playwright
 
 root = pathlib.Path(__file__).resolve().parents[1]
@@ -81,7 +81,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.reload()
     page.wait_for_function('window.__ready')
     page.wait_for_function('audio.readyState>=1 && audio.currentTime>=9')
-    assert page.locator('#ver').inner_text()=='v7'
+    assert page.locator('#ver').inner_text()==re.search(r"APP_VERSION='([^']+)'", (root/'app.js').read_text())[1]
     assert page.locator('#list li').count()==2
     page.evaluate("""() => {
       if(audio!==document.querySelector('audio')||document.querySelectorAll('audio').length!==1)throw Error('Multiple audio elements');

@@ -74,28 +74,49 @@ const BR1=[0,32,40,48,56,64,80,96,112,128,160,192,224,256,320],BR2=[0,8,16,24,32
 function hdr(u,p){if(u[p]!==0xFF||(u[p+1]&0xE0)!==0xE0)return null;const v=(u[p+1]>>3)&3,l=(u[p+1]>>1)&3;if(v===1||l!==1)return null;
  const bi=u[p+2]>>4,si=(u[p+2]>>2)&3;if(bi===0||bi===15||si===3)return null;const v1=v===3;
  const sr=SR[si]/(v1?1:v===2?2:4),br=(v1?BR1:BR2)[bi]*1000,pad=(u[p+2]>>1)&1;
- return{len:Math.floor((v1?144:72)*br/sr)+pad,sr,smp:v1?1152:576}}
+ return{len:Math.floor((v1?144:72)*br/sr)+pad,sr,smp:v1?1152:576,v,mode:u[p+3]>>6}}
 function parseMp3(u){let p=0,end=u.length;
  while(end-p>10&&u[p]===0x49&&u[p+1]===0x44&&u[p+2]===0x33){p+=10+(((u[p+6]&127)<<21)|((u[p+7]&127)<<14)|((u[p+8]&127)<<7)|(u[p+9]&127))+((u[p+5]&0x10)?10:0)}
  if(end-p>128&&u[end-128]===0x54&&u[end-127]===0x41&&u[end-126]===0x47)end-=128;
  let h=null,lim=Math.min(end-4,p+65536);while(p<lim&&!(h=hdr(u,p)))p++;if(!h)return null;
- const sr=h.sr;let start=p,samples=0,first=true,q=p,miss=0;
+ const sr=h.sr;let start=p,samples=0,first=true,q=p,miss=0,header=null;const offsets=[];
  while(q+4<=end){const f=hdr(u,q);if(!f||q+f.len>end){if(++miss>4096)break;q++;continue}
   if(first){first=false;const w=String.fromCharCode(...u.subarray(q+4,Math.min(q+f.len,q+60)));if(/Xing|Info|VBRI/.test(w)){q+=f.len;start=q;continue}}
-  samples+=f.smp;q+=f.len;p=q}
- if(!samples)return null;return{start,end:p,dur:samples/sr,sr}}
+  if(f.sr!==sr||f.v!==h.v||(f.mode===3)!==(h.mode===3))return null;
+  if(!header)header=u.slice(q,q+4);offsets.push(q-start);samples+=f.smp;q+=f.len;p=q}
+ if(!samples)return null;return{start,end:p,dur:samples/sr,sr,header,offsets,v:h.v,mode:header[3]>>6}}
+// One Xing frame describes the whole joined stream, not each original file.
+// Counts exclude this metadata frame; byte count and TOC include its bytes.
+function xingFrame(header,offsets,bytes){
+ const frameHeader=header.slice();frameHeader[1]|=1; // No CRC in this new frame.
+ const v=(frameHeader[1]>>3)&3,mono=(frameHeader[3]>>6)===3;
+ frameHeader[2]=(frameHeader[2]&0x0D)|((v===3?9:8)<<4); // 128/64 kbps, no padding.
+ const size=hdr(frameHeader,0).len,frame=new Uint8Array(size);
+ frame.set(frameHeader);const at=4+(v===3?(mono?17:32):(mono?9:17));
+ frame.set([88,105,110,103],at); // Xing
+ const view=new DataView(frame.buffer),totalBytes=bytes+size;
+ view.setUint32(at+4,7); // Frames + bytes + 100-entry seek TOC.
+ view.setUint32(at+8,offsets.length);view.setUint32(at+12,totalBytes);
+ for(let n=0;n<100;n++){
+  const offset=n===0?0:size+offsets[Math.min(offsets.length-1,Math.floor(n*offsets.length/100))];
+  frame[at+16+n]=Math.min(255,Math.floor(256*offset/totalBytes));
+ }
+ return frame;
+}
 async function buildChunk(i){
- const k=order.indexOf(i);if(k<0)return null;const parts=[],segs=[];let bytes=0,t=0,sr=0;
+ const k=order.indexOf(i);if(k<0)return null;const parts=[],segs=[],offsets=[];let bytes=0,t=0,sr=0,header=null,version=null,mode=null;
  for(let j=0;j<order.length;j++){
   if(k+j>=order.length&&S.repeat!=='all')break;
   const idx=order[(k+j)%order.length],s=songs[idx];
   const b=await tx('blobs','readonly',st=>st.get(s.id));if(!b)break;
   const type=b instanceof Blob?b.type:b.type;if(type&&type!=='audio/mpeg'&&type!=='audio/mp3'){if(j===0)return null;break}
   const u=new Uint8Array(b instanceof Blob?await b.arrayBuffer():b.buf);const r=parseMp3(u);
-  if(!r||(sr&&r.sr!==sr)||(j>0&&bytes+(r.end-r.start)>CAP)){if(j===0)return null;break}
-  sr=r.sr;parts.push(u.subarray(r.start,r.end));bytes+=r.end-r.start;segs.push({i:idx,id:s.id,start:t,dur:r.dur});t+=r.dur}
+  if(!r||(sr&&(r.sr!==sr||r.v!==version||r.mode!==mode))||(j>0&&bytes+(r.end-r.start)>CAP)){if(j===0)return null;break}
+  sr=r.sr;version=r.v;mode=r.mode;if(!header)header=r.header;
+  for(const offset of r.offsets)offsets.push(bytes+offset);
+  parts.push(u.subarray(r.start,r.end));bytes+=r.end-r.start;segs.push({i:idx,id:s.id,start:t,dur:r.dur});t+=r.dur}
  if(!segs.length)return null;
- return{url:URL.createObjectURL(new Blob(parts,{type:'audio/mpeg'})),segs,total:t,loop:S.repeat==='all'&&segs.length===order.length}}
+ return{url:URL.createObjectURL(new Blob([xingFrame(header,offsets,bytes),...parts],{type:'audio/mpeg'})),segs,total:t,loop:S.repeat==='all'&&segs.length===order.length}}
 function findSeg(t){if(!C)return -1;let r=0;for(let n=0;n<C.segs.length;n++)if(t>=C.segs[n].start-0.05)r=n;return r}
 function setSeg(n){if(!C||n<0)return;const g=C.segs[n];segIdx=n;cur=songs.findIndex(x=>x.id===g.id);const s=songs[cur];if(!s)return;
  $('title').textContent=s.title;$('seek').max=Math.floor(g.dur)||0;$('dur').textContent=fmt(g.dur);S.lastId=s.id;save();render();session(s);posState()}
@@ -167,9 +188,20 @@ function onEnded(){
  if(pre&&pre.i===n&&pre.url&&pre.id===songs[n].id){const u=pre.url;pre=null;apply(n,u,true);return}
  load(n,true);
 }
-function posState(){if('mediaSession' in navigator&&navigator.mediaSession.setPositionState&&(C||(audio.duration&&isFinite(audio.duration)))){
- const g=C&&segIdx>=0?C.segs[segIdx]:null,d=g?g.dur:audio.duration,p=g?audio.currentTime-g.start:audio.currentTime;
- try{navigator.mediaSession.setPositionState({duration:d,playbackRate:audio.playbackRate||1,position:Math.max(0,Math.min(p,d))})}catch(e){}}}
+function posState(){
+ if(!('mediaSession' in navigator)||!navigator.mediaSession.setPositionState)return;
+ const rate=Number.isFinite(audio.playbackRate)&&audio.playbackRate>0?audio.playbackRate:1;
+ const valid=(d,p)=>Number.isFinite(d)&&d>0&&Number.isFinite(p)&&p>=0&&p<=d;
+ const publish=(d,p)=>{
+  if(!valid(d,p))return false;
+  try{navigator.mediaSession.setPositionState({duration:d,playbackRate:rate,position:p});return true}catch(e){return false}
+ };
+ const g=C&&segIdx>=0?C.segs[segIdx]:null;
+ // Prefer the displayed song's clock, but retry using the media element if rejected.
+ if(g&&publish(g.dur,audio.currentTime-g.start))return;
+ const d=audio.duration,p=audio.currentTime;
+ if(Number.isFinite(d)&&d>0&&Number.isFinite(p))publish(d,Math.max(0,Math.min(p,d)));
+}
 function session(s){if(!('mediaSession' in navigator))return;
  navigator.mediaSession.metadata=new MediaMetadata({title:s.title,artist:'畑プレーヤー',artwork:[192,512].map(size=>({src:new URL('icon-'+size+'.png',location.href).href,sizes:size+'x'+size,type:'image/png'}))});
 }
@@ -179,19 +211,19 @@ function playbackSession(){
  try{if(navigator.audioSession)navigator.audioSession.type='playback'}catch(e){}
 }
 function pausePlayback(){
- ++playAttempt;userPaused=true;audio.pause();
+ ++playAttempt;userPaused=true;audio.pause();stopTicker();clearTimeout(pauseTimer);
  // Do not clear src or metadata: Control Center must still be able to resume.
  S.lastPos=rel();save();playbackState('paused');
 }
 function startAudio(recover=true){
- const attempt=++playAttempt;userPaused=false;playbackSession();
+ const attempt=++playAttempt;userPaused=false;clearTimeout(pauseTimer);playbackSession();
  // This must be synchronous in the Media Session action's call stack. No DB awaits.
  let playing;try{playing=audio.play()}catch(e){playing=Promise.reject(e)}
  const i=cur>=0?cur:(order[0]??0),position=cur>=0?rel():S.lastPos;
  const source=audio.src,generation=building;
  return Promise.resolve(playing).then(()=>{
   if(attempt!==playAttempt)return;
-  if(songs[cur])session(songs[cur]);playbackState('playing');
+  if(songs[cur])session(songs[cur]);playbackState('playing');startTicker();
  }).catch(async e=>{
   if(attempt!==playAttempt||userPaused||source!==audio.src||generation!==building)return;
   playbackState('paused');
@@ -222,31 +254,59 @@ $('repeat').onclick=()=>{S.repeat={none:'all',all:'one',one:'none'}[S.repeat];sa
 $('dark').onclick=()=>{S.dark=!S.dark;save();ui()};
 $('file').onchange=e=>{const f=[...e.target.files];e.target.value='';if(f.length)addFiles(f)};
 $('seek').oninput=e=>{seekAbs((C&&segIdx>=0?C.segs[segIdx].start:0)+(+e.target.value))};
-audio.onplay=()=>{$('play').textContent='⏸';$('play').setAttribute('aria-label','一時停止');playbackState('playing')};
-audio.onpause=()=>{$('play').textContent='▶';$('play').setAttribute('aria-label','再生');S.lastPos=rel();save();playbackState('paused')};
-audio.onended=()=>{onEnded();if(audio.paused)playbackState('paused')};audio.addEventListener('loadedmetadata',posState);audio.addEventListener('ratechange',posState);
-let lastSave=0;
-audio.ontimeupdate=()=>{
- let t=audio.currentTime;
+let ticker=null,pauseTimer=null,lastSave=0;
+function stopTicker(){if(ticker!==null){clearInterval(ticker);ticker=null}}
+function startTicker(){
+ if(audio.paused)return;
+ if(ticker===null)ticker=setInterval(updateProgress,250);
+ updateProgress();
+}
+function markPaused(){
+ $('play').textContent='▶';$('play').setAttribute('aria-label','再生');
+ S.lastPos=rel();save();playbackState('paused');
+}
+audio.onplay=()=>{
+ clearTimeout(pauseTimer);$('play').textContent='⏸';$('play').setAttribute('aria-label','一時停止');
+ playbackState('playing');startTicker();
+};
+audio.onpause=()=>{
+ stopTicker();clearTimeout(pauseTimer);
+ if(userPaused){markPaused();return}
+ // iOS can emit pause during seeks / buffering / audio-route changes.
+ pauseTimer=setTimeout(()=>{if(audio.paused)markPaused();else startTicker()},300);
+};
+audio.onended=()=>{stopTicker();clearTimeout(pauseTimer);onEnded();if(audio.paused)playbackState('paused')};
+audio.addEventListener('loadedmetadata',()=>{updateProgress();posState()});
+audio.addEventListener('durationchange',posState);audio.addEventListener('ratechange',posState);
+audio.addEventListener('playing',()=>{clearTimeout(pauseTimer);playbackState('playing');startTicker()});
+audio.addEventListener('seeked',()=>{updateProgress();if(!audio.paused)startTicker()});
+function updateProgress(){
+ let t=audio.currentTime;if(!Number.isFinite(t)||t<0)return;
  if(C){
   if(t<1&&lastAbs>5&&!(C.loop&&lastAbs>C.total-3)&&!audio.paused&&document.hidden){}else{
    if(S.repeat==='one'&&segIdx>=0){const g=C.segs[segIdx];if(t>=g.start+g.dur-0.25||findSeg(t)!==segIdx){seekAbs(g.start);t=g.start}}
    const n=findSeg(t);if(n!==segIdx)setSeg(n);lastAbs=t}
-  const g=C.segs[Math.max(segIdx,0)],r=t-g.start;$('cur').textContent=fmt(r);$('seek').value=Math.floor(r)}
- else{$('cur').textContent=fmt(t);$('seek').value=Math.floor(t);lastAbs=t;
-  if(audio.duration&&isFinite(audio.duration)){$('seek').max=Math.floor(audio.duration);$('dur').textContent=fmt(audio.duration)}}
- const n=Date.now();if(n-lastSave>3000){lastSave=n;posState();S.lastPos=rel();save()}};
+  const g=C.segs[Math.max(segIdx,0)],r=Math.max(0,Math.min(g.dur,t-g.start));
+  $('cur').textContent=fmt(r);$('seek').value=Math.floor(r);
+ }else{
+  $('cur').textContent=fmt(t);$('seek').value=Math.floor(t);lastAbs=t;
+  if(Number.isFinite(audio.duration)&&audio.duration>0){$('seek').max=Math.floor(audio.duration);$('dur').textContent=fmt(audio.duration)}
+ }
+ posState(); // Every tick; only persistence is throttled.
+ const n=Date.now();if(n-lastSave>3000){lastSave=n;S.lastPos=rel();save()}
+}
+audio.ontimeupdate=updateProgress;
 document.addEventListener('visibilitychange',()=>{
  if(document.hidden){if(cur>=0){S.lastPos=rel();save()}return}
  if(cur<0||userPaused)return;
  const wrap=C&&C.loop&&lastAbs>C.total-3;
  if(audio.currentTime<1&&lastAbs>5&&!wrap)seekAbs(lastAbs);
- if(audio.paused)startAudio();
+ if(audio.paused)startAudio();else startTicker();
 });
 
 window.addEventListener('pagehide',()=>{if(cur>=0){S.lastPos=rel();save();posState()}});
 
-const APP_VERSION='v7';
+const APP_VERSION='v8';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');
