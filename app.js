@@ -161,7 +161,8 @@ function restorePosition(position,job=loadJob,url=audio.src){
   const seeked=()=>{if(!current())finish(false);else if(metadataSeen&&!audio.seeking)finish(true)};
   const metadata=()=>{
    if(!current()){finish(false);return}
-   if(metadataSeen)return;metadataSeen=true;
+   // readyState may briefly still describe the previous source after src changes.
+   if(audio.readyState<1||audio.currentSrc!==url||metadataSeen)return;metadataSeen=true;
    let target=Number.isFinite(position)?Math.max(0,position):0;
    if(Number.isFinite(audio.duration)&&audio.duration>0)target=Math.min(target,Math.max(0,audio.duration-0.01));
    try{
@@ -175,7 +176,7 @@ function restorePosition(position,job=loadJob,url=audio.src){
   if(job)job.cancel=cancel;
   timer=setTimeout(()=>finish(false,new Error('読み込みに時間がかかっています。曲を選び直してください')),20000);
   if(audio.src!==url)audio.src=url;
-  if(audio.readyState>=1)metadata();
+  if(audio.readyState>=1&&audio.currentSrc===url)metadata();
  });
 }
 async function load(i,play=false,pos=0){
