@@ -32,6 +32,7 @@ function getDuration(blob){return new Promise(res=>{const a=new Audio();const u=
  a.preload='metadata';a.onloadedmetadata=()=>done(a.duration);a.onerror=()=>done(0);setTimeout(()=>done(0),8000);a.src=u})}
 
 async function addFiles(files){
+ const hadSongs=!!songs.length;
  let n=0,ok=0;
  for(const f of files){
   msg('取り込み中… '+(++n)+'/'+files.length+' '+f.name);
@@ -48,13 +49,16 @@ async function addFiles(files){
   ok++;
  }
  if(ok>=0)msg(ok+'曲を取り込みました');render();usage();makeOrder();if(C)rebuild();else prefetch();
- if(cur<0&&songs.length)load(0,false);
+ if(!hadSongs&&cur<0&&songs.length)load(0,false);
 }
 async function del(i){
  const s=songs[i];if(!confirm('「'+s.title+'」を削除しますか？'))return;
  await tx('blobs','readwrite',st=>st.delete(s.id));await tx('meta','readwrite',st=>st.delete(s.id));
  const wasCur=i===cur;songs.splice(i,1);
- if(wasCur){pausePlayback();audio.removeAttribute('src');cur=-1;if(songs.length)load(Math.min(i,songs.length-1),false);else idleScreen()}
+ if(wasCur){pausePlayback();audio.removeAttribute('src');try{audio.load()}catch(e){}
+  dropC();if(urlNow){revokeUnused(urlNow);urlNow=null}
+  if('mediaSession' in navigator){try{navigator.mediaSession.metadata=null}catch(e){}}
+  cur=-1;lastAbs=0;if(songs.length)await load(Math.min(i,songs.length-1),false);else{idleScreen();ui()}}
  else if(i<cur)cur--;
  makeOrder();render();usage();dropPre();if(C&&!wasCur)rebuild();else prefetch();
 }
@@ -125,7 +129,7 @@ async function buildChunk(i){
 function findSeg(t){if(!C)return -1;let r=0;for(let n=0;n<C.segs.length;n++)if(t>=C.segs[n].start-0.05)r=n;return r}
 function setSeg(n){if(!C||n<0)return;const g=C.segs[n];segIdx=n;cur=songs.findIndex(x=>x.id===g.id);const s=songs[cur];if(!s)return;
  $('title').textContent=s.title;$('seek').max=Math.floor(g.dur)||0;$('dur').textContent=fmt(g.dur);S.lastId=s.id;if(!loadJob)save();render();session(s);posState()}
-function seekAbs(t){audio.currentTime=t;lastAbs=t}
+function seekAbs(t){if(!audio.getAttribute('src'))return;try{audio.currentTime=t;lastAbs=t}catch(e){}}
 function rel(){return C&&segIdx>=0?audio.currentTime-C.segs[segIdx].start:audio.currentTime}
 function dropC(){if(C){const u=C.url;C=null;segIdx=-1;if(u!==urlNow)revokeUnused(u)}}
 async function rebuild(){if(!C||cur<0)return;const r=rel(),pl=!audio.paused;await load(cur,pl,r)}
@@ -274,10 +278,12 @@ function pausePlayback(){
  if(!loadJob){S.lastPos=rel();save()}playbackState('paused');
 }
 function startAudio(recover=true){
- if(cur<0&&!loadJob&&!initializing){
-  wantPlay=false;userPaused=true;msg(songs.length?'曲を選んでください':'曲を追加してください');return Promise.resolve();
+ if(cur<0&&!loadJob){
+  wantPlay=false;userPaused=true;
+  if(!initializing)msg(songs.length?'曲を選んでください':'曲を追加してください');
+  return Promise.resolve();
  }
- if(initializing||loadJob||!audio.getAttribute('src')||cur<0){
+ if(initializing||loadJob||!audio.getAttribute('src')){
   wantPlay=true;userPaused=false;msg('読み込み中… 再生を予約しました');return Promise.resolve();
  }
  wantPlay=false;
@@ -379,7 +385,7 @@ document.addEventListener('visibilitychange',()=>{
 
 window.addEventListener('pagehide',()=>{if(cur>=0&&!loadJob){S.lastPos=rel();save();posState()}});
 
-const APP_VERSION='v10';
+const APP_VERSION='v11';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');

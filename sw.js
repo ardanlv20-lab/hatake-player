@@ -1,4 +1,4 @@
-const VERSION='v10';
+const VERSION='v11';
 const CACHE='hatake-player-'+VERSION;
 const SHELL=['./','index.html','app.js','manifest.webmanifest','icon-180.png','icon-192.png','icon-512.png'];
 

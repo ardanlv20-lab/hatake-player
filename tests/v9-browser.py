@@ -109,8 +109,31 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
       if(newer)await newer;
       if(loadJob||cur!==2||Math.abs(audio.currentTime-2)>0.05)throw Error('Stale metadata seek escaped cancellation');
     }""")
-    assert page.locator('#ver').inner_text()=='v10'
+    page.evaluate("sessionStorage.removeItem('holdBuild')")
+    page.reload();page.wait_for_function('window.__ready && !loadJob && cur===-1', timeout=30000)
+    page.set_input_files('#file', files[0])
+    page.wait_for_function('songs.length===7 && !loadJob', timeout=60000)
+    page.evaluate("""() => {
+      if(cur!==-1)throw Error('Idle add auto-loaded a song');
+      if(document.getElementById('title').textContent!=='曲を選んでください')throw Error('Idle add changed title');
+      if(audio.getAttribute('src'))throw Error('Idle add set audio src');
+      document.getElementById('seek').value=0;
+      document.getElementById('seek').dispatchEvent(new Event('input'));
+    }""")
+    page.evaluate('() => { load(0,false) }')
+    page.wait_for_function('cur===0 && !loadJob && audio.readyState>=1', timeout=30000)
+    page.evaluate("""async () => {
+      if(!C||!urlNow||!audio.getAttribute('src'))throw Error('Expected loaded chunk');
+      const oldConfirm=window.confirm;window.confirm=()=>true;
+      while(songs.length>1)await del(songs.length-1);
+      if(cur!==0||!C||!urlNow)throw Error('Deleting other songs cleared the current track');
+      await del(0);
+      window.confirm=oldConfirm;
+      if(C||urlNow||audio.getAttribute('src')||cur!==-1)throw Error('Last-song delete leaked playback: C='+!!C+' urlNow='+!!urlNow+' src='+audio.getAttribute('src')+' cur='+cur);
+      if(document.getElementById('title').textContent!=='曲を追加してください')throw Error('Wrong empty title');
+    }""")
+    assert page.locator('#ver').inner_text()=='v11'
     assert not errors,errors
-    print('PASS v10: idle startup, metadata-already-ready seek, early play stays queued, no recovery/cancellation, seek-before-first-play, queue cancellation, newer-load ownership, retained src, no page errors')
+    print('PASS v11: idle startup, no idle-add autoload, last-song cleanup, metadata-already-ready seek, early play stays queued, no recovery/cancellation, seek-before-first-play, queue cancellation, newer-load ownership, retained src, no page errors')
     browser.close()
 server.shutdown()
