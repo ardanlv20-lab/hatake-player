@@ -77,7 +77,10 @@ async function usage(){
 }
 function makeOrder(){order=songs.map((_,i)=>i);if(S.shuffle)for(let i=order.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[order[i],order[j]]=[order[j],order[i]]}}
 // ===== 連続再生モード（MP3を1本につなげて再生） =====
-const CAP=150*1048576;
+// Avoid a new src at an arbitrary 150MB boundary while iOS has suspended JS.
+// Blob slices keep the joined audio out of JS memory (only one song is parsed at
+// a time). Xing's byte counter is 32-bit; reserve room for its metadata frame.
+const CAP=0xFFFFFFFF-4096;
 let C=null,segIdx=-1,lastAbs=0,userPaused=true,building=0;
 const BR1=[0,32,40,48,56,64,80,96,112,128,160,192,224,256,320],BR2=[0,8,16,24,32,40,48,56,64,80,96,112,128,144,160],SR=[44100,48000,32000];
 function hdr(u,p){if(u[p]!==0xFF||(u[p+1]&0xE0)!==0xE0)return null;const v=(u[p+1]>>3)&3,l=(u[p+1]>>1)&3;if(v===1||l!==1)return null;
@@ -115,17 +118,17 @@ function xingFrame(header,offsets,bytes){
 async function buildChunk(i){
  const k=order.indexOf(i);if(k<0)return null;const parts=[],segs=[],offsets=[];let bytes=0,t=0,sr=0,header=null,version=null,mode=null;
  for(let j=0;j<order.length;j++){
-  if(k+j>=order.length&&S.repeat!=='all')break;
+  if((j>0&&S.repeat==='one')||(k+j>=order.length&&S.repeat!=='all'))break;
   const idx=order[(k+j)%order.length],s=songs[idx];
   const b=await tx('blobs','readonly',st=>st.get(s.id));if(!b)break;
   const type=b instanceof Blob?b.type:b.type;if(type&&type!=='audio/mpeg'&&type!=='audio/mp3'){if(j===0)return null;break}
   const u=new Uint8Array(b instanceof Blob?await b.arrayBuffer():b.buf);const r=parseMp3(u);
-  if(!r||(sr&&(r.sr!==sr||r.v!==version||r.mode!==mode))||(j>0&&bytes+(r.end-r.start)>CAP)){if(j===0)return null;break}
+  if(!r||(sr&&(r.sr!==sr||r.v!==version||(r.mode===3)!==(mode===3)))||(bytes+(r.end-r.start)>CAP)){if(j===0)return null;break}
   sr=r.sr;version=r.v;mode=r.mode;if(!header)header=r.header;
   for(const offset of r.offsets)offsets.push(bytes+offset);
-  parts.push(u.subarray(r.start,r.end));bytes+=r.end-r.start;segs.push({i:idx,id:s.id,start:t,dur:r.dur});t+=r.dur}
+  parts.push(toBlob(b).slice(r.start,r.end));bytes+=r.end-r.start;segs.push({i:idx,id:s.id,start:t,dur:r.dur});t+=r.dur}
  if(!segs.length)return null;
- return{url:URL.createObjectURL(new Blob([xingFrame(header,offsets,bytes),...parts],{type:'audio/mpeg'})),segs,total:t,loop:S.repeat==='all'&&segs.length===order.length}}
+ return{url:URL.createObjectURL(new Blob([xingFrame(header,offsets,bytes),...parts],{type:'audio/mpeg'})),segs,total:t,loop:S.repeat==='one'||(S.repeat==='all'&&segs.length===order.length)}}
 function findSeg(t){if(!C)return -1;let r=0;for(let n=0;n<C.segs.length;n++)if(t>=C.segs[n].start-0.05)r=n;return r}
 function setSeg(n){if(!C||n<0)return;const g=C.segs[n];segIdx=n;cur=songs.findIndex(x=>x.id===g.id);const s=songs[cur];if(!s)return;
  $('title').textContent=s.title;$('seek').max=Math.floor(g.dur)||0;$('dur').textContent=fmt(g.dur);S.lastId=s.id;if(!loadJob)save();render();session(s);posState()}
@@ -232,7 +235,7 @@ async function load(i,play=false,pos=0){
 function step(d){
  if(!songs.length)return;
  if(cur<0){msg('曲を選んでください');return}
- if(C){let n=segIdx+d;if(C.loop)n=(n+C.segs.length)%C.segs.length;
+ if(C){let n=segIdx+d;if(C.loop&&S.repeat==='all')n=(n+C.segs.length)%C.segs.length;
   if(n>=0&&n<C.segs.length){seekAbs(C.segs[n].start+0.01);setSeg(n);startAudio();return}
   if(n<0){seekAbs(C.segs[0].start);return}
   const last=C.segs[C.segs.length-1].i,k=order.indexOf(last)+1;
@@ -362,7 +365,6 @@ function updateProgress(){
  let t=audio.currentTime;if(!Number.isFinite(t)||t<0)return;
  if(C){
   if(t<1&&lastAbs>5&&!(C.loop&&lastAbs>C.total-3)&&!audio.paused&&document.hidden){}else{
-   if(S.repeat==='one'&&segIdx>=0){const g=C.segs[segIdx];if(t>=g.start+g.dur-0.25||findSeg(t)!==segIdx){seekAbs(g.start);t=g.start}}
    const n=findSeg(t);if(n!==segIdx)setSeg(n);lastAbs=t}
   const g=C.segs[Math.max(segIdx,0)],r=Math.max(0,Math.min(g.dur,t-g.start));
   $('cur').textContent=fmt(r);$('seek').value=Math.floor(r);
@@ -385,7 +387,7 @@ document.addEventListener('visibilitychange',()=>{
 
 window.addEventListener('pagehide',()=>{if(cur>=0&&!loadJob){S.lastPos=rel();save();posState()}});
 
-const APP_VERSION='v11';
+const APP_VERSION='v12';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');
@@ -404,7 +406,10 @@ $('update').onclick=async()=>{
  if('serviceWorker' in navigator){
   const had=!!navigator.serviceWorker.controller;
   navigator.serviceWorker.addEventListener('controllerchange',()=>{
-   if(!had)return;const k='hp-reloaded',t=+sessionStorage.getItem(k)||0;
+   if(!had)return;
+   // Updating the worker must not tear down playing OR paused remote audio.
+   if(loadJob||wantPlay||audio.getAttribute('src')){msg('更新があります。再生を終えて「アプリを更新」を押してください');return}
+   const k='hp-reloaded',t=+sessionStorage.getItem(k)||0;
    if(Date.now()-t<30000)return;sessionStorage.setItem(k,Date.now());location.reload()});
   navigator.serviceWorker.register('sw.js',{updateViaCache:'none'}).then(r=>{window.__reg=r;r.update().catch(()=>{})}).catch(e=>console.warn(e));
   document.addEventListener('visibilitychange',()=>{if(!document.hidden&&window.__reg)window.__reg.update().catch(()=>{})});
