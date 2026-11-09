@@ -21,8 +21,8 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v13'
-    assert page.locator('#convert').inner_text()=='MP3に変換'
+    assert page.locator('#ver').inner_text()=='v14'
+    assert page.locator('#convert').inner_text()=='形式をそろえる'
     assert page.evaluate("getComputedStyle(document.getElementById('convert')).minHeight")=='64px'
     page.set_input_files('#file',[m4a,mp3])
     page.wait_for_function("songs.length===2 && cur===0 && !loadJob && audio.readyState>=1",timeout=60000)
@@ -36,7 +36,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     assert a['title']=='field-song' and a['type']=='audio/mpeg' and a['mp3'] and a['meta']==a['size'] and 1.8<a['dur']<2.5,info
     assert b['type']=='audio/mpeg' and b['mp3'] and b['size']==mp3size,('mp3 re-encoded?',info,mp3size)
     assert info['segs']==2,('converted m4a should join the mp3 stream',info)
-    assert '2曲を取り込みました（うち1曲をMP3に変換しました）' in page.evaluate("document.getElementById('msg').textContent")
+    assert '2曲を取り込みました（うち1曲を44.1kHzステレオのMP3に変換しました）' in page.evaluate("document.getElementById('msg').textContent")
     # Simulate an old (pre-v13) m4a import already stored in IDB, then use the button.
     page.evaluate("""async (bytes) => {
       const buf=new Uint8Array(bytes).buffer,id='old-m4a';
@@ -45,18 +45,18 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
       await tx('meta','readwrite',st=>st.put(meta));songs.push(meta);render();makeOrder();
     }""",list(open(old,'rb').read()))
     page.click('#convert')
-    page.wait_for_function("!document.getElementById('convert').disabled && document.getElementById('msg').textContent.includes('曲をMP3に変換しました')",timeout=60000)
+    page.wait_for_function("!document.getElementById('convert').disabled && document.getElementById('msg').textContent.includes('曲を44.1kHzステレオのMP3にそろえました')",timeout=60000)
     res=page.evaluate("""async () => {
       const s=songs.find(x=>x.id==='old-m4a');const b=await tx('blobs','readonly',st=>st.get('old-m4a'));const u=new Uint8Array(b.buf);
       const m=(await tx('meta','readonly',st=>st.get('old-m4a')));
       return {title:s.title,mtitle:m.title,type:b.type,mp3:isMp3(u),size:u.length,msize:m.size,dur:m.duration,n:songs.length,msg:document.getElementById('msg').textContent,cur,paused:audio.paused,sr:parseMp3(u).sr}
     }""")
     assert res['title']=='昔の曲'==res['mtitle'] and res['type']=='audio/mpeg' and res['mp3'] and res['size']==res['msize'] and 2.8<res['dur']<3.5 and res['n']==3,res
-    assert res['msg'].startswith('1曲をMP3に変換しました'),res
+    assert res['msg'].startswith('1曲を44.1kHzステレオのMP3にそろえました'),res
     assert res['cur']==0 and res['paused'],('no surprise autoplay',res)
     page.wait_for_function("!loadJob && C && C.segs.length===3",timeout=20000)  # 48k m4a decoded at 44.1k joins
     page.click('#convert')
-    page.wait_for_function("document.getElementById('msg').textContent==='変換が必要な曲はありません'",timeout=20000)
+    page.wait_for_function("document.getElementById('msg').textContent==='そろえる必要がある曲はありません'",timeout=20000)
     # Non-empty idle library: adding converts but must not auto-load. Undecodable file is kept.
     page.evaluate("sessionStorage.removeItem('holdBuild')");page.reload();page.wait_for_function('window.__ready')
     assert page.evaluate('cur')==-1
@@ -69,11 +69,11 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     assert r2['cur']==-1 and r2['title']=='曲を選んでください',r2
     assert r2['out'][0]['mp3'] and r2['out'][0]['type']=='audio/mpeg',r2
     assert not r2['out'][1]['mp3'] and r2['out'][1]['type']!='audio/mpeg',r2
-    assert 'うち1曲をMP3に変換しました' in r2['msg'] and 'protected.m4a' in r2['msg'],r2
+    assert 'うち1曲を44.1kHzステレオのMP3に変換しました' in r2['msg'] and 'protected.m4a' in r2['msg'],r2
     # Button: failed song stays, message says so; MP3s untouched.
     sizes=page.evaluate("songs.slice(0,4).map(s=>s.size)")
     page.click('#convert')
-    page.wait_for_function("!document.getElementById('convert').disabled && document.getElementById('msg').textContent.includes('変換できなかった曲')",timeout=30000)
+    page.wait_for_function("!document.getElementById('convert').disabled && document.getElementById('msg').textContent.includes('そろえられなかった曲')",timeout=30000)
     assert page.evaluate("songs.slice(0,4).map(s=>s.size)")==sizes
     # Offline: the encoder must come from the service-worker cache, and still convert.
     ctx2=browser.new_context();pg=ctx2.new_page();pg.on('pageerror',lambda e:errors.append(str(e)))
@@ -81,7 +81,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     ctx2.set_offline(True);pg.reload();pg.wait_for_function('window.__ready')
     assert pg.evaluate("typeof lamejs==='function' && !!lamejs.Mp3Encoder"),'encoder not cached offline'
     pg.set_input_files('#file',[m4a])
-    pg.wait_for_function("songs.length===1 && document.getElementById('msg').textContent.includes('うち1曲をMP3に変換しました')",timeout=60000)
+    pg.wait_for_function("songs.length===1 && document.getElementById('msg').textContent.includes('うち1曲を44.1kHzステレオのMP3に変換しました')",timeout=60000)
     ctx2.close()
     assert not errors,errors
     print('PASS v13: m4a converted on import (empty-library cur===0, joins mp3 stream), mp3 not re-encoded, old m4a converted in place by button (same id/title, no autoplay), nothing-to-convert message, mono wav converted, undecodable file kept, idle add no autoload, offline encoder from SW cache')

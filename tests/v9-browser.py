@@ -132,8 +132,8 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
       if(C||urlNow||audio.getAttribute('src')||cur!==-1)throw Error('Last-song delete leaked playback: C='+!!C+' urlNow='+!!urlNow+' src='+audio.getAttribute('src')+' cur='+cur);
       if(document.getElementById('title').textContent!=='曲を追加してください')throw Error('Wrong empty title');
     }""")
-    assert page.locator('#ver').inner_text()=='v13'
+    assert page.locator('#ver').inner_text()=='v14'
     assert not errors,errors
-    print('PASS v13: idle startup, no idle-add autoload, last-song cleanup, metadata-already-ready seek, early play stays queued, no recovery/cancellation, seek-before-first-play, queue cancellation, newer-load ownership, retained src, no page errors')
+    print('PASS v14: idle startup, no idle-add autoload, last-song cleanup, metadata-already-ready seek, early play stays queued, no recovery/cancellation, seek-before-first-play, queue cancellation, newer-load ownership, retained src, no page errors')
     browser.close()
 server.shutdown()
