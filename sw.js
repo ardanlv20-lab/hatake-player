@@ -1,6 +1,6 @@
-const VERSION='v12';
+const VERSION='v13';
 const CACHE='hatake-player-'+VERSION;
-const SHELL=['./','index.html','app.js','manifest.webmanifest','icon-180.png','icon-192.png','icon-512.png'];
+const SHELL=['./','index.html','app.js','lame.min.js','manifest.webmanifest','icon-180.png','icon-192.png','icon-512.png'];
 
 self.addEventListener('install',e=>{
   self.skipWaiting();
@@ -22,7 +22,7 @@ self.addEventListener('activate',e=>{
 function cacheKeyFor(req){
   const path=new URL(req.url).pathname;
   if(req.mode==='navigate'||path.endsWith('/')||/\.html$/.test(path))return 'index.html';
-  if(/\.js$/.test(path))return 'app.js';
+  if(/\.js$/.test(path)){const name=path.split('/').pop();return SHELL.includes(name)?name:'app.js'}
   if(/\.webmanifest$/.test(path))return 'manifest.webmanifest';
   return null;
 }
@@ -33,7 +33,6 @@ async function matchShell(req){
   const tries=[];
   if(key)tries.push(key);
   if(key==='index.html')tries.push('./','index.html');
-  if(key==='app.js')tries.push('app.js');
   tries.push(req);
   for(const t of tries){
     const hit=await c.match(t,{ignoreSearch:true});

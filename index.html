@@ -27,7 +27,10 @@ button.on{background:var(--acc);color:#000}
 .row button{flex:1}
 #play{flex:1.6;font-size:40px;min-height:96px;background:var(--acc);color:#000}
 #ctrl button{font-size:32px;min-height:96px}
-#add{display:block;text-align:center;line-height:58px;margin:12px 0;background:var(--acc);color:#000}
+#addrow{margin:12px 0}
+#add{display:block;flex:2;text-align:center;line-height:58px;background:var(--acc);color:#000}
+#convert{flex:1;font-size:18px}
+#convert:disabled{opacity:.5}
 #file{display:none}
 ul{list-style:none;padding:0;margin:0}
 li{display:flex;align-items:center;gap:8px;border-bottom:2px solid var(--sub);padding:6px 0}
@@ -55,12 +58,16 @@ li button{min-height:56px;min-width:56px;font-size:20px}
     <button id="repeat">🔁 リピートなし</button>
   </div>
 </div>
-<label class="btn" id="add">＋ 曲を追加（ファイルから）<input id="file" type="file" multiple></label>
+<div class="row" id="addrow">
+  <label class="btn" id="add">＋ 曲を追加（ファイルから）<input id="file" type="file" multiple></label>
+  <button id="convert">MP3に変換</button>
+</div>
 <div id="msg"></div>
 <div id="usage"></div>
-<div style="font-size:14px;margin:12px 0;opacity:.8">バージョン <span id="ver">v12</span> <button class="btn" id="update" style="font-size:14px;padding:6px 10px">アプリを更新</button></div>
+<div style="font-size:14px;margin:12px 0;opacity:.8">バージョン <span id="ver">v13</span> <button class="btn" id="update" style="font-size:14px;padding:6px 10px">アプリを更新</button></div>
 <ul id="list"></ul>
 <audio id="audio" preload="auto" playsinline></audio>
-<script src="app.js?v=12"></script>
+<script src="lame.min.js?v=13"></script>
+<script src="app.js?v=13"></script>
 </body>
 </html>

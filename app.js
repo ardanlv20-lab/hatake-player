@@ -31,16 +31,131 @@ function getDuration(blob){return new Promise(res=>{const a=new Audio();const u=
  const done=d=>{revokeUnused(u);res(isFinite(d)?d:0)};
  a.preload='metadata';a.onloadedmetadata=()=>done(a.duration);a.onerror=()=>done(0);setTimeout(()=>done(0),8000);a.src=u})}
 
+// ===== MP3変換（m4a・wavなどをMP3にして連続再生モードに入れる） =====
+// Bytes decide, not MIME: anything parseMp3 accepts is never re-encoded.
+function isMp3(u){
+ if(u.length<16)return false;
+ const tag=String.fromCharCode(...u.subarray(0,12));
+ // Container signatures (m4a/mp4 ftyp, wav, flac, ogg, aiff, caf) are never MP3,
+ // even if random bytes inside look like MP3 frame headers.
+ if(/^(RIFF|fLaC|OggS|FORM|caff)/.test(tag)||tag.slice(4,8)==='ftyp')return false;
+ const r=parseMp3(u);if(!r||r.offsets.length<2)return false;
+ let p=0;while(u.length-p>10&&u[p]===0x49&&u[p+1]===0x44&&u[p+2]===0x33)p+=10+(((u[p+6]&127)<<21)|((u[p+7]&127)<<14)|((u[p+8]&127)<<7)|(u[p+9]&127))+((u[p+5]&0x10)?10:0);
+ return (r.end-r.start)>=0.5*(u.length-p);
+}
+const MP3_RATES=[8000,11025,12000,16000,22050,24000,32000,44100,48000];
+const MAX_CONVERT_SEC=30*60; // Decoded PCM of longer files can exhaust iPhone memory.
+let actx=null,encQ=Promise.resolve();
+function audioCtx(){
+ if(actx)return actx;
+ const A=window.AudioContext||window.webkitAudioContext;if(!A)return null;
+ // 44.1kHz output matches most MP3s, so converted songs join the same stream.
+ try{actx=new A({sampleRate:44100})}catch(e){try{actx=new A()}catch(e2){actx=null}}
+ return actx;
+}
+const tick=()=>new Promise(r=>setTimeout(r,0));
+// Decode with Web Audio and encode to 192kbps MP3. Returns ArrayBuffer or throws.
+async function toMp3(raw,onPct){
+ if(!window.lamejs||!lamejs.Mp3Encoder)throw new Error('変換プログラムが読み込まれていません');
+ const ctx=audioCtx();if(!ctx)throw new Error('この端末では変換できません');
+ if(ctx.state==='suspended'){try{await ctx.resume()}catch(e){}}
+ // decodeAudioData detaches its input, and old Safari only has the callback form.
+ let ab=await new Promise((res,rej)=>{let p;
+  try{p=ctx.decodeAudioData(raw.slice(0),res,e=>rej(e||new Error('decode')))}catch(e){rej(e);return}
+  if(p&&p.then)p.then(res,rej)});
+ const sr=ab.sampleRate;if(!MP3_RATES.includes(sr))throw new Error('サンプリング周波数 '+sr+'Hz はMP3にできません');
+ if(!ab.length)throw new Error('音声が空です');
+ const nch=ab.numberOfChannels,stereo=nch>=2,len=ab.length;
+ const chans=[];for(let c=0;c<nch;c++)chans.push(ab.getChannelData(c));
+ const enc=new lamejs.Mp3Encoder(stereo?2:1,sr,192);
+ const BLOCK=1152*32,L=new Int16Array(BLOCK),R=stereo?new Int16Array(BLOCK):null,out=[];
+ const s16=v=>v<=-1?-32768:v>=1?32767:Math.round(v<0?v*32768:v*32767);
+ // Downmix >2 channels: odd channels to left, even to right (center/LFE shared).
+ const left=[],right=[];
+ if(nch<=2){left.push(chans[0]);if(stereo)right.push(chans[1])}
+ else chans.forEach((d,c)=>{if(c%2===0)left.push(d);else right.push(d)});
+ for(let o=0;o<len;o+=BLOCK){
+  const n=Math.min(BLOCK,len-o);
+  for(let i=0;i<n;i++){
+   let a=0;for(const d of left)a+=d[o+i];L[i]=s16(a/left.length);
+   if(R){let b=0;for(const d of right)b+=d[o+i];R[i]=s16(b/right.length)}
+  }
+  // Encode in 1152-sample MP3 frames.
+  for(let f=0;f<n;f+=1152){const e=Math.min(n,f+1152);
+   const m=enc.encodeBuffer(L.subarray(f,e),R?R.subarray(f,e):L.subarray(f,e));if(m.length)out.push(new Uint8Array(m.buffer,m.byteOffset,m.length))}
+  if((o/BLOCK)%8===7){if(onPct)onPct(Math.floor(100*o/len));await tick()}
+ }
+ const m=enc.flush();if(m.length)out.push(new Uint8Array(m.buffer,m.byteOffset,m.length));
+ chans.length=0;left.length=0;right.length=0;ab=null; // Drop the decoded PCM early.
+ const buf=await new Blob(out,{type:'audio/mpeg'}).arrayBuffer();out.length=0;
+ if(!isMp3(new Uint8Array(buf)))throw new Error('変換結果がMP3になりませんでした');
+ return buf;
+}
+// One conversion at a time (import and button) to limit iPhone memory.
+function convertOne(raw,onPct){const job=encQ.then(()=>toMp3(raw,onPct));encQ=job.catch(()=>{});return job}
+async function convertLibrary(){
+ const btn=$('convert');if(btn.disabled)return;btn.disabled=true;
+ try{
+  msg('変換が必要な曲を探しています…');
+  const todo=[];
+  for(const s of songs.slice()){
+   const b=await tx('blobs','readonly',st=>st.get(s.id));if(!b)continue;
+   const u=new Uint8Array(b instanceof Blob?await b.arrayBuffer():b.buf);
+   const type=b.type||'';
+   if(isMp3(u)){
+    // Already MP3 bytes: never re-encode; only fix a wrong stored type.
+    if(type!=='audio/mpeg'&&type!=='audio/mp3')await tx('blobs','readwrite',st=>st.put({buf:u.buffer.byteLength===u.length?u.buffer:u.slice().buffer,type:'audio/mpeg'},s.id));
+    continue}
+   todo.push(s.id);
+  }
+  if(!todo.length){msg('変換が必要な曲はありません');return}
+  let done=0,n=0;const failed=[];let curChanged=false;
+  for(const id of todo){
+   const s=songs.find(x=>x.id===id);if(!s)continue;n++;
+   const label='変換中… '+n+'/'+todo.length+' '+s.title;msg(label);
+   try{
+    const b=await tx('blobs','readonly',st=>st.get(id));if(!b)continue;
+    if(s.duration>MAX_CONVERT_SEC)throw new Error('長すぎる');
+    const raw=b instanceof Blob?await b.arrayBuffer():b.buf;
+    const mp3=await convertOne(raw,p=>msg(label+'（'+p+'%）'));
+    const now=songs.find(x=>x.id===id);if(!now)continue; // Deleted meanwhile.
+    const r=parseMp3(new Uint8Array(mp3));
+    const meta=Object.assign({},now,{size:mp3.byteLength,duration:r?r.dur:now.duration});
+    await tx('blobs','readwrite',st=>st.put({buf:mp3,type:'audio/mpeg'},id));
+    await tx('meta','readwrite',st=>st.put(meta));
+    Object.assign(now,meta);done++;
+    if(cur>=0&&songs[cur]&&songs[cur].id===id)curChanged=true;
+   }catch(e){console.warn(e);failed.push(s.title)}
+  }
+  let t=done+'曲をMP3に変換しました';
+  if(failed.length)t+='（変換できなかった曲: '+failed.join('、')+'。Apple Musicなど保護された曲や長すぎる曲は元のまま残しています）';
+  render();usage();makeOrder();dropPre();
+  if(done&&cur>=0&&(C||curChanged)&&!loadJob){
+   // Rejoin with the new MP3s; only resumes if it was already playing.
+   const playing=!audio.paused,pos=rel();await load(cur,playing,pos);
+  }else if(done)prefetch();
+  msg(t);
+ }finally{btn.disabled=false}
+}
+
 async function addFiles(files){
  const hadSongs=!!songs.length;
- let n=0,ok=0;
+ let n=0,ok=0,conv=0;const failed=[];
  for(const f of files){
-  msg('取り込み中… '+(++n)+'/'+files.length+' '+f.name);
+  const label='取り込み中… '+(++n)+'/'+files.length+' '+f.name;msg(label);
   const ext=(f.name.split('.').pop()||'').toLowerCase();
   const types={mp3:'audio/mpeg',m4a:'audio/mp4',aac:'audio/aac',wav:'audio/wav',mp4:'audio/mp4',caf:'audio/x-caf',aif:'audio/aiff',aiff:'audio/aiff',flac:'audio/flac',ogg:'audio/ogg',opus:'audio/ogg'};
   if(!(f.type||'').startsWith('audio/')&&!types[ext]){msg('音楽ファイルではないのでスキップ: '+f.name);continue}
   let buf;try{buf=await f.arrayBuffer()}catch(e){msg('読み込めませんでした（iCloudにあるファイルは先にダウンロードしてください）: '+f.name);continue}
-  const type=(f.type&&f.type.startsWith('audio/'))?f.type:(types[ext]||'audio/mpeg');
+  let type=(f.type&&f.type.startsWith('audio/'))?f.type:(types[ext]||'audio/mpeg');
+  if(isMp3(new Uint8Array(buf)))type='audio/mpeg'; // Already MP3: keep bytes as-is.
+  else{
+   msg(label+'（MP3に変換中）');
+   try{
+    if((await getDuration(new Blob([buf],{type})))>MAX_CONVERT_SEC)throw new Error('長すぎる');
+    buf=await convertOne(buf,p=>msg(label+'（MP3に変換中 '+p+'%）'));type='audio/mpeg';conv++;
+   }catch(e){console.warn(e);failed.push(f.name)} // Keep the original playable file.
+  }
   const blob=new Blob([buf],{type});
   const id=Date.now().toString(36)+Math.random().toString(36).slice(2,7);
   const meta={id,title:f.name.replace(/\.[^.]+$/,''),duration:await getDuration(blob),size:blob.size,added:Date.now()};
@@ -48,8 +163,11 @@ async function addFiles(files){
   catch(e){msg('保存できませんでした: '+f.name+'（'+(e&&e.name||e)+'）');ok=-1;break}
   ok++;
  }
- if(ok>=0)msg(ok+'曲を取り込みました');render();usage();makeOrder();if(C)rebuild();else prefetch();
- if(!hadSongs&&cur<0&&songs.length)load(0,false);
+ let t='';if(ok>=0){t=ok+'曲を取り込みました';if(conv)t+='（うち'+conv+'曲をMP3に変換しました）';
+  if(failed.length)t+='。MP3に変換できなかった曲（元のまま保存）: '+failed.join('、')+'（Apple Musicなど保護された曲は変換できません）';msg(t)}
+ render();usage();makeOrder();if(C)rebuild();else prefetch();
+ // Keep the import result visible after the first song finishes loading.
+ if(!hadSongs&&cur<0&&songs.length){if(await load(0,false)&&t&&(conv||failed.length))msg(t)}
 }
 async function del(i){
  const s=songs[i];if(!confirm('「'+s.title+'」を削除しますか？'))return;
@@ -332,6 +450,7 @@ $('next').onclick=()=>step(1);
 $('shuffle').onclick=()=>{S.shuffle=!S.shuffle;makeOrder();save();ui();if(C)rebuild();else prefetch()};
 $('repeat').onclick=()=>{S.repeat={none:'all',all:'one',one:'none'}[S.repeat];save();ui();if(C)rebuild();else prefetch()};
 $('dark').onclick=()=>{S.dark=!S.dark;save();ui()};
+$('convert').onclick=()=>convertLibrary();
 $('file').onchange=e=>{const f=[...e.target.files];e.target.value='';if(f.length)addFiles(f)};
 $('seek').oninput=e=>{seekAbs((C&&segIdx>=0?C.segs[segIdx].start:0)+(+e.target.value))};
 let ticker=null,pauseTimer=null,lastSave=0;
@@ -387,7 +506,7 @@ document.addEventListener('visibilitychange',()=>{
 
 window.addEventListener('pagehide',()=>{if(cur>=0&&!loadJob){S.lastPos=rel();save();posState()}});
 
-const APP_VERSION='v12';
+const APP_VERSION='v13';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');
