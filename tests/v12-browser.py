@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     for n,joint in enumerate([0,1,0]):
         path=str(pathlib.Path(tmp)/f'stereo-{n}.mp3')
         subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-f','lavfi','-i',
-                        f'sine=frequency={440+n*80}:duration=2','-ar','44100','-ac','2',
+                        f'sine=frequency={440+n*80}:duration=2','-af','volume=12dB','-ar','44100','-ac','2',  # loud: kept byte-identical (v15)
                         '-b:a','320k','-joint_stereo',str(joint),'-y',path],check=True)
         files.append(path)
     browser=p.chromium.launch(args=['--autoplay-policy=no-user-gesture-required'])

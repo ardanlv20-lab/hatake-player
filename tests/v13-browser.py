@@ -11,7 +11,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     t=pathlib.Path(tmp)
     m4a=str(t/'field-song.m4a');mp3=str(t/'plain.mp3');old=str(t/'old.m4a');mono=str(t/'mono.wav');bad=str(t/'protected.m4a')
     ff('-f','lavfi','-i','sine=frequency=440:duration=2','-ar','44100','-ac','2','-c:a','aac','-b:a','128k','-y',m4a)
-    ff('-f','lavfi','-i','sine=frequency=550:duration=2','-ar','44100','-ac','2','-b:a','192k','-y',mp3)
+    ff('-f','lavfi','-i','sine=frequency=550:duration=2','-af','volume=12dB','-ar','44100','-ac','2','-b:a','192k','-y',mp3)  # loud: v15 never re-encodes it
     ff('-f','lavfi','-i','sine=frequency=660:duration=3','-ar','48000','-ac','2','-c:a','aac','-b:a','128k','-y',old)
     ff('-f','lavfi','-i','sine=frequency=330:duration=1','-ar','22050','-ac','1','-y',mono)
     data=bytearray(open(m4a,'rb').read());data[200:]=os.urandom(len(data)-200);open(bad,'wb').write(data)  # undecodable stand-in for DRM
@@ -21,8 +21,8 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v14'
-    assert page.locator('#convert').inner_text()=='形式をそろえる'
+    assert page.locator('#ver').inner_text()=='v15'
+    assert page.locator('#convert').inner_text()=='形式と音量をそろえる'
     assert page.evaluate("getComputedStyle(document.getElementById('convert')).minHeight")=='64px'
     page.set_input_files('#file',[m4a,mp3])
     page.wait_for_function("songs.length===2 && cur===0 && !loadJob && audio.readyState>=1",timeout=60000)
