@@ -226,7 +226,7 @@ async function convertLibrary(){
     if(r.buf){
      const pm=parseMp3(new Uint8Array(r.buf));
      Object.assign(meta,{size:r.buf.byteLength,duration:pm?pm.dur:now.duration});
-     await tx('blobs','readwrite',st=>st.put({buf:r.buf,type:'audio/mpeg'},id));
+     await tx('blobs','readwrite',st=>st.put({buf:r.buf,type:'audio/mpeg'},id));parseCache.delete(id);
      if(format)fmtN++;if(r.gainDb)boostN++;
      if(cur>=0&&songs[cur]&&songs[cur].id===id)curChanged=true;
     }
@@ -289,7 +289,7 @@ async function addFiles(files){
 }
 async function del(i){
  const s=songs[i];if(!confirm('「'+s.title+'」を削除しますか？'))return;
- await tx('blobs','readwrite',st=>st.delete(s.id));await tx('meta','readwrite',st=>st.delete(s.id));
+ await tx('blobs','readwrite',st=>st.delete(s.id));await tx('meta','readwrite',st=>st.delete(s.id));parseCache.delete(s.id);
  const wasCur=i===cur;songs.splice(i,1);
  if(wasCur){pausePlayback();audio.removeAttribute('src');try{audio.load()}catch(e){}
   dropC();if(urlNow){revokeUnused(urlNow);urlNow=null}
@@ -332,7 +332,7 @@ function parseMp3(u){let p=0,end=u.length;
   if(first){first=false;const w=String.fromCharCode(...u.subarray(q+4,Math.min(q+f.len,q+60)));if(/Xing|Info|VBRI/.test(w)){q+=f.len;start=q;continue}}
   if(f.sr!==sr||f.v!==h.v||(f.mode===3)!==(h.mode===3))return null;
   if(!header)header=u.slice(q,q+4);offsets.push(q-start);samples+=f.smp;q+=f.len;p=q}
- if(!samples)return null;return{start,end:p,dur:samples/sr,sr,header,offsets,v:h.v,mode:header[3]>>6}}
+ if(!samples)return null;return{start,end:p,dur:samples/sr,sr,header,offsets,v:h.v,mode:header[3]>>6,smp:h.smp}}
 // One Xing frame describes the whole joined stream, not each original file.
 // Counts exclude this metadata frame; byte count and TOC include its bytes.
 function xingFrame(header,offsets,bytes){
@@ -351,20 +351,48 @@ function xingFrame(header,offsets,bytes){
  }
  return frame;
 }
-async function buildChunk(i){
- const k=order.indexOf(i);if(k<0)return null;const parts=[],segs=[],offsets=[];let bytes=0,t=0,sr=0,header=null,version=null,mode=null;
+// Parsed frame tables per song (bytes never change for an id without a size change;
+// conversion and delete also drop the entry). Avoids re-reading/parsing on every skip.
+const parseCache=new Map();
+async function songFrames(id,b){
+ const size=b instanceof Blob?b.size:b.buf.byteLength,c=parseCache.get(id);
+ if(c&&c.size===size)return c.r;
+ const r=parseMp3(new Uint8Array(b instanceof Blob?await b.arrayBuffer():b.buf));
+ if(r){r.offsets=Int32Array.from(r.offsets);parseCache.set(id,{size,r})}
+ return r;
+}
+// The chunk always begins exactly at the requested song position (frame-accurate, byte 0),
+// so a skip/seek never relies on the browser seeking inside a long joined stream: Safari
+// and Chromium map time->byte via the 100-entry, 1/256-resolution Xing TOC or an average
+// bitrate, which can land seconds (or a whole song) off in a multi-hour stream.
+// With a native loop and a mid-song start, the skipped head of the first song is appended
+// at the end so the loop continues seamlessly.
+async function buildChunk(i,pos=0){
+ const k=order.indexOf(i);if(k<0)return null;const parts=[],segs=[],offsets=[];let bytes=0,t=0,sr=0,header=null,version=null,mode=null,count=0,head=null;
  for(let j=0;j<order.length;j++){
   if((j>0&&S.repeat==='one')||(k+j>=order.length&&S.repeat!=='all'))break;
   const idx=order[(k+j)%order.length],s=songs[idx];
   const b=await tx('blobs','readonly',st=>st.get(s.id));if(!b)break;
   const type=b instanceof Blob?b.type:b.type;if(type&&type!=='audio/mpeg'&&type!=='audio/mp3'){if(j===0)return null;break}
-  const u=new Uint8Array(b instanceof Blob?await b.arrayBuffer():b.buf);const r=parseMp3(u);
+  const r=await songFrames(s.id,b);
   if(!r||(sr&&(r.sr!==sr||r.v!==version||(r.mode===3)!==(mode===3)))||(bytes+(r.end-r.start)>CAP)){if(j===0)return null;break}
   sr=r.sr;version=r.v;mode=r.mode;if(!header)header=r.header;
-  for(const offset of r.offsets)offsets.push(bytes+offset);
-  parts.push(toBlob(b).slice(r.start,r.end));bytes+=r.end-r.start;segs.push({i:idx,id:s.id,start:t,dur:r.dur});t+=r.dur}
+  let f=0;
+  if(j===0&&pos>0){f=Math.min(r.offsets.length-1,Math.max(0,Math.floor(pos*sr/r.smp)));t=-f*r.smp/sr}
+  const from=r.offsets[f];
+  for(let n=f;n<r.offsets.length;n++)offsets.push(bytes+r.offsets[n]-from);
+  parts.push(toBlob(b).slice(r.start+from,r.end));bytes+=r.end-r.start-from;segs.push({i:idx,id:s.id,start:t,dur:r.dur});t+=r.dur;count++;
+  if(f>0)head={i:idx,id:s.id,b,r,f,off:-segs[0].start};
+ }
  if(!segs.length)return null;
- return{url:URL.createObjectURL(new Blob([xingFrame(header,offsets,bytes),...parts],{type:'audio/mpeg'})),segs,total:t,loop:S.repeat==='one'||(S.repeat==='all'&&segs.length===order.length)}}
+ const loop=S.repeat==='one'||(S.repeat==='all'&&count===order.length);
+ if(loop&&head){
+  const {r,f,off}=head;
+  for(let n=0;n<f;n++)offsets.push(bytes+r.offsets[n]);
+  parts.push(toBlob(head.b).slice(r.start,r.start+r.offsets[f]));bytes+=r.offsets[f];
+  segs.push({i:head.i,id:head.id,start:t,dur:r.dur,head:true});t+=off;
+ }
+ return{url:URL.createObjectURL(new Blob([xingFrame(header,offsets,bytes),...parts],{type:'audio/mpeg'})),segs,total:t,count,loop}}
 function findSeg(t){if(!C)return -1;let r=0;for(let n=0;n<C.segs.length;n++)if(t>=C.segs[n].start-0.05)r=n;return r}
 function setSeg(n){if(!C||n<0)return;const g=C.segs[n];segIdx=n;cur=songs.findIndex(x=>x.id===g.id);const s=songs[cur];if(!s)return;
  $('title').textContent=s.title;$('seek').max=Math.floor(g.dur)||0;$('dur').textContent=fmt(g.dur);S.lastId=s.id;if(!loadJob)save();render();session(s);posState()}
@@ -430,13 +458,14 @@ async function load(i,play=false,pos=0){
  if(i<0||i>=songs.length)return false;
  const previous=loadJob,my=++building;
  if(previous&&previous.cancel)previous.cancel();
- const job=loadJob={generation:my,id:songs[i].id,cancel:null};
+ const job=loadJob={generation:my,id:songs[i].id,pos:Math.max(0,pos||0),cancel:null};
+ if(pendingOrder&&pendingOrder[0]===i){order=pendingOrder;pendingOrder=null}
  if(play){wantPlay=true;userPaused=false}
  stopTicker();audio.pause();clearTimeout(pauseTimer);
  $('title').textContent=songs[i].title;msg('読み込み中…');
  let ch=null;
  try{
-  try{ch=await buildChunk(i)}catch(e){console.warn(e)}
+  try{ch=await buildChunk(i,pos)}catch(e){console.warn(e)}
   if(loadJob!==job){if(ch)revokeUnused(ch.url);return false}
   const old=urlNow,oc=C;let url;
   if(ch){
@@ -452,14 +481,14 @@ async function load(i,play=false,pos=0){
    dropC();cur=i;urlNow=url;ui();
    const song=songs[i];$('title').textContent=song.title;$('seek').max=Math.floor(song.duration)||0;
    $('dur').textContent=fmt(song.duration);session(song);render();
-   if(pendingOrder&&pendingOrder[0]===i){order=pendingOrder;pendingOrder=null}
   }
-  const ready=restorePosition(pos,job,url);
+  // A chunk already starts at the requested position (within one ~26ms frame).
+  const ready=restorePosition(ch?0:pos,job,url);
   if(old&&old!==url)revokeUnused(old);if(oc&&oc.url!==old&&oc.url!==url)revokeUnused(oc.url);
   if(!await ready||loadJob!==job)return false;
   loadJob=null;lastAbs=audio.currentTime;
   S.lastId=songs[cur].id;S.lastPos=rel();save();updateProgress();
-  msg(ch?'連続再生モード（'+ch.segs.length+'曲をつなげて再生中）':'通常モード（MP3以外の曲は1曲ずつ再生）');
+  msg(ch?'連続再生モード（'+ch.count+'曲をつなげて再生中）':'通常モード（MP3以外の曲は1曲ずつ再生）');
   if(!ch)setTimeout(prefetch,0);
   if(wantPlay&&!initializing){wantPlay=false;startAudio()}
   return true;
@@ -468,21 +497,33 @@ async function load(i,play=false,pos=0){
   return false;
  }
 }
+// Song the user is on, counting a skip/seek that is still loading.
+function curIdx(){if(loadJob){const n=songs.findIndex(x=>x.id===loadJob.id);if(n>=0)return n}return cur}
+function curPos(){return loadJob?loadJob.pos:rel()}
+const playingNow=()=>!audio.paused||wantPlay;
+// User skips (buttons, lock screen) always start a fresh chunk at the target song's
+// first frame; only unattended playback crosses song boundaries inside one stream.
 function step(d){
  if(!songs.length)return;
- if(cur<0){msg('曲を選んでください');return}
- if(C){let n=segIdx+d;if(C.loop&&S.repeat==='all')n=(n+C.segs.length)%C.segs.length;
-  if(n>=0&&n<C.segs.length){seekAbs(C.segs[n].start+0.01);setSeg(n);startAudio();return}
-  if(n<0){seekAbs(C.segs[0].start);return}
-  const last=C.segs[C.segs.length-1].i,k=order.indexOf(last)+1;
-  if(k<order.length){load(order[k],true);return}if(S.repeat==='all'){load(order[0],true);return}audio.pause();return}
- if(d>0){const n=nextIdx();if(n<0){audio.pause();return}load(n,true);return}
- let k=order.indexOf(cur)+d;
+ const c=curIdx();
+ if(c<0){msg('曲を選んでください');return}
+ if(d>0){const save=cur;cur=c;const n=nextIdx();cur=save;if(n<0){if(!loadJob)audio.pause();return}load(n,true);return}
+ let k=order.indexOf(c)+d;
  if(k<0)k=S.repeat==='all'?order.length-1:0;
  load(order[k],true);
 }
+// Seek inside the current song (seconds from its start). In a joined stream this rebuilds
+// the chunk starting at that position instead of seeking the long stream.
+function seekSong(t){
+ const c=curIdx();if(c<0||!audio.getAttribute('src')&&!loadJob)return;
+ const g=C&&segIdx>=0&&!loadJob?C.segs[segIdx]:null;
+ const d=g?g.dur:loadJob?(songs[c].duration||0):(Number.isFinite(audio.duration)?audio.duration:0);
+ t=Math.max(0,d>0?Math.min(t,Math.max(0,d-0.05)):t);
+ if(C||loadJob){load(c,playingNow(),t);return}
+ seekAbs(t);posState();
+}
 function onEnded(){
- if(C){if(S.repeat==='one'){seekAbs(C.segs[segIdx].start);startAudio();return}
+ if(C){if(S.repeat==='one'){load(cur,true,0);return} // Normally the native loop handles this.
   const last=C.segs[C.segs.length-1].i,k=order.indexOf(last)+1;
   if(k<order.length){load(order[k],true);return}if(S.repeat==='all'&&order.length){load(order[0],true);return}userPaused=true;return}
  if(S.repeat==='one'){seekAbs(0);startAudio();return}
@@ -554,7 +595,7 @@ function startAudio(recover=true){
 }
 if('mediaSession' in navigator){const m=navigator.mediaSession,h=(a,f)=>{try{m.setActionHandler(a,f)}catch(e){}};
  h('play',()=>startAudio());h('pause',pausePlayback);h('stop',pausePlayback);h('previoustrack',()=>step(-1));h('nexttrack',()=>step(1));
- h('seekto',e=>{seekAbs((C&&segIdx>=0?C.segs[segIdx].start:0)+e.seekTime);posState()});h('seekbackward',e=>{seekAbs(Math.max(0,audio.currentTime-(e.seekOffset||10)));posState()});h('seekforward',e=>{seekAbs(Math.min(audio.duration||0,audio.currentTime+(e.seekOffset||10)));posState()});}
+ h('seekto',e=>seekSong(e.seekTime));h('seekbackward',e=>seekSong(curPos()-(e.seekOffset||10)));h('seekforward',e=>seekSong(curPos()+(e.seekOffset||10)));}
 function ui(){
  $('shuffle').classList.toggle('on',S.shuffle);
  $('repeat').classList.toggle('on',S.repeat!=='none');
@@ -563,14 +604,17 @@ function ui(){
  audio.loop=C?C.loop:S.repeat==='one';
 }
 $('play').onclick=()=>{if(loadJob||initializing){if(wantPlay)pausePlayback();else startAudio();return}if(audio.paused)startAudio();else pausePlayback()};
-$('prev').onclick=()=>{if(rel()>3)seekAbs(C&&segIdx>=0?C.segs[segIdx].start:0);else step(-1)};
+$('prev').onclick=()=>{if(curIdx()>=0&&curPos()>3)seekSong(0);else step(-1)};
 $('next').onclick=()=>step(1);
 $('shuffle').onclick=()=>{S.shuffle=!S.shuffle;makeOrder();save();ui();if(C)rebuild();else prefetch()};
 $('repeat').onclick=()=>{S.repeat={none:'all',all:'one',one:'none'}[S.repeat];save();ui();if(C)rebuild();else prefetch()};
 $('dark').onclick=()=>{S.dark=!S.dark;save();ui()};
 $('convert').onclick=()=>convertLibrary();
 $('file').onchange=e=>{const f=[...e.target.files];e.target.value='';if(f.length)addFiles(f)};
-$('seek').oninput=e=>{seekAbs((C&&segIdx>=0?C.segs[segIdx].start:0)+(+e.target.value))};
+// Dragging only previews the time; releasing seeks once (one rebuild, not one per pixel).
+let dragging=false;
+$('seek').oninput=e=>{dragging=true;$('cur').textContent=fmt(+e.target.value)};
+$('seek').onchange=e=>{dragging=false;seekSong(+e.target.value)};
 let ticker=null,pauseTimer=null,lastSave=0;
 function stopTicker(){if(ticker!==null){clearInterval(ticker);ticker=null}}
 function startTicker(){
@@ -604,9 +648,9 @@ function updateProgress(){
   if(t<1&&lastAbs>5&&!(C.loop&&lastAbs>C.total-3)&&!audio.paused&&document.hidden){}else{
    const n=findSeg(t);if(n!==segIdx)setSeg(n);lastAbs=t}
   const g=C.segs[Math.max(segIdx,0)],r=Math.max(0,Math.min(g.dur,t-g.start));
-  $('cur').textContent=fmt(r);$('seek').value=Math.floor(r);
+  if(!dragging){$('cur').textContent=fmt(r);$('seek').value=Math.floor(r)}
  }else{
-  $('cur').textContent=fmt(t);$('seek').value=Math.floor(t);lastAbs=t;
+  if(!dragging){$('cur').textContent=fmt(t);$('seek').value=Math.floor(t)}lastAbs=t;
   if(Number.isFinite(audio.duration)&&audio.duration>0){$('seek').max=Math.floor(audio.duration);$('dur').textContent=fmt(audio.duration)}
  }
  posState(); // Every tick; only persistence is throttled.
@@ -624,7 +668,7 @@ document.addEventListener('visibilitychange',()=>{
 
 window.addEventListener('pagehide',()=>{if(cur>=0&&!loadJob){S.lastPos=rel();save();posState()}});
 
-const APP_VERSION='v15';
+const APP_VERSION='v16';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');

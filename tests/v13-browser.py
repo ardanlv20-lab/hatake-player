@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v15'
+    assert page.locator('#ver').inner_text()=='v16'
     assert page.locator('#convert').inner_text()=='形式と音量をそろえる'
     assert page.evaluate("getComputedStyle(document.getElementById('convert')).minHeight")=='64px'
     page.set_input_files('#file',[m4a,mp3])

@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v15'
+    assert page.locator('#ver').inner_text()=='v16'
     assert page.locator('#convert').inner_text()=='形式と音量をそろえる'
     assert page.evaluate("getComputedStyle(document.getElementById('convert')).minHeight")=='64px'
     # Import path (empty library): quiet + peaky boosted, loud byte-identical, all joined, cur===0.
@@ -107,7 +107,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     ctx2=browser.new_context();pg=ctx2.new_page();pg.on('pageerror',lambda e:errors.append(str(e)))
     pg.goto(url);pg.wait_for_function('window.__ready');pg.wait_for_function('navigator.serviceWorker.controller!==null',timeout=20000)
     ctx2.set_offline(True);pg.reload();pg.wait_for_function('window.__ready')
-    assert pg.locator('#ver').inner_text()=='v15'
+    assert pg.locator('#ver').inner_text()=='v16'
     pg.set_input_files('#file',[quiet,loud])
     pg.wait_for_function("songs.length===2 && cur===0 && !loadJob && C && C.segs.length===2",timeout=60000)
     assert '（1曲の音量を上げました）' in pg.evaluate(MSG),pg.evaluate(MSG)

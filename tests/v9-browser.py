@@ -23,13 +23,15 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
       navigator.mediaSession.setActionHandler=(a,f)=>{actions[a]=f;register(a,f)};
       const play=HTMLMediaElement.prototype.play;
       HTMLMediaElement.prototype.play=function(){
-        playCalls.push({time:this.currentTime,src:this.getAttribute('src'),title:document.getElementById('title')?.textContent});
+        playCalls.push({time:(typeof C!=='undefined'&&C)?rel():this.currentTime,  // song position (v16 chunks start at it)
+                        src:this.getAttribute('src'),title:document.getElementById('title')?.textContent});
         return play.call(this);
       };
       window.__holdBuild=sessionStorage.getItem('holdBuild')==='yes';
       window.__buildGate=new Promise(resolve=>{window.__releaseBuild=()=>{window.__holdBuild=false;resolve()}});
     """)
-    source=(root/'app.js').read_text().replace('async function buildChunk(i){','async function buildChunk(i){if(window.__holdBuild)await window.__buildGate;')
+    assert 'async function buildChunk(i,pos=0){' in (root/'app.js').read_text(),'build gate hook no longer matches'
+    source=(root/'app.js').read_text().replace('async function buildChunk(i,pos=0){','async function buildChunk(i,pos=0){if(window.__holdBuild)await window.__buildGate;')
     context.route('**/app.js*',lambda route:route.fulfill(status=200,content_type='text/javascript',body=source))
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
@@ -37,7 +39,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.set_input_files('#file',files)
     page.wait_for_function('songs.length===6 && cur===0 && !loadJob && audio.readyState>=1')
     page.evaluate('load(1,false,3.25)')
-    page.wait_for_function('cur===1 && !loadJob && Math.abs(audio.currentTime-3.25)<0.05')
+    page.wait_for_function('cur===1 && !loadJob && Math.abs(rel()-3.25)<0.05')
     page.evaluate('pausePlayback()')
     page.reload();page.wait_for_function('window.__ready && !loadJob')
     page.evaluate("""() => {
@@ -46,7 +48,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
       if(audio.getAttribute('src'))throw Error('Startup loaded audio');
     }""")
     page.evaluate('load(1,false,3.25)')
-    page.wait_for_function('cur===1 && !loadJob && Math.abs(audio.currentTime-3.25)<0.05')
+    page.wait_for_function('cur===1 && !loadJob && Math.abs(rel()-3.25)<0.05')
     page.evaluate("""() => {
       if(document.getElementById('title').textContent!=='song-2')throw Error('Wrong loaded title');
       if(C.segs[0].id!==songs[1].id)throw Error('Wrong chunk start');
@@ -81,7 +83,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.evaluate("""() => {
       if(building!==restoreGeneration||cur!==1||C.segs[0].id!==songs[1].id)throw Error('Wrong restore won');
       if(playCalls.length!==1||playCalls[0].time<3.2||playCalls[0].title!=='song-2')throw Error('Play happened before seek');
-      if(!playCalls[0].src||Math.abs(audio.currentTime-3.25)>0.8)throw Error('Wrong playback position');
+      if(!playCalls[0].src||Math.abs(rel()-3.25)>0.8)throw Error('Wrong playback position');
       const src=audio.src;actions.pause();if(audio.src!==src)throw Error('Pause cleared source');
       seekAbs(3.25);pausePlayback();
     }""")
@@ -107,7 +109,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
       audio.addEventListener('loadedmetadata',()=>{newer=load(2,false,2)},{once:true});
       await load(1,false,5);
       if(newer)await newer;
-      if(loadJob||cur!==2||Math.abs(audio.currentTime-2)>0.05)throw Error('Stale metadata seek escaped cancellation');
+      if(loadJob||cur!==2||Math.abs(rel()-2)>0.05)throw Error('Stale metadata seek escaped cancellation');
     }""")
     page.evaluate("sessionStorage.removeItem('holdBuild')")
     page.reload();page.wait_for_function('window.__ready && !loadJob && cur===-1', timeout=30000)
@@ -132,8 +134,8 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
       if(C||urlNow||audio.getAttribute('src')||cur!==-1)throw Error('Last-song delete leaked playback: C='+!!C+' urlNow='+!!urlNow+' src='+audio.getAttribute('src')+' cur='+cur);
       if(document.getElementById('title').textContent!=='曲を追加してください')throw Error('Wrong empty title');
     }""")
-    assert page.locator('#ver').inner_text()=='v15'
+    assert page.locator('#ver').inner_text()=='v16'
     assert not errors,errors
-    print('PASS v15: idle startup, no idle-add autoload, last-song cleanup, metadata-already-ready seek, early play stays queued, no recovery/cancellation, seek-before-first-play, queue cancellation, newer-load ownership, retained src, no page errors')
+    print('PASS v16: idle startup, no idle-add autoload, last-song cleanup, metadata-already-ready seek, early play stays queued, no recovery/cancellation, seek-before-first-play, queue cancellation, newer-load ownership, retained src, no page errors')
     browser.close()
 server.shutdown()
