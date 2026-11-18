@@ -1,5 +1,5 @@
-"""Keep the UI responsive during loudness check / import (v17). Chromium + ffmpeg + numpy.
-Run: python3 tests/v17-browser.py"""
+"""Keep the UI responsive during loudness check (v17). Chromium + ffmpeg + numpy.
+Import stores files as-is (v18); convert button does the analysis. Run: python3 tests/v17-browser.py"""
 import functools, http.server, pathlib, subprocess, tempfile, threading, wave
 import numpy as np
 from playwright.sync_api import sync_playwright
@@ -41,32 +41,42 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v17'
+    assert page.locator('#ver').inner_text()=='v18'
     assert page.locator('#convert').inner_text()=='形式と音量をそろえる'
     page.evaluate(HEART)
     page.set_input_files('#file',[loud,quiet,s48])
-    page.wait_for_function("songs.length===3 && cur===0 && !loadJob && document.getElementById('msg').textContent.includes('取り込みました')",timeout=120000)
+    page.wait_for_function("songs.length===3 && cur===0 && !loadJob && document.getElementById('msg').textContent.includes('取り込みました')",timeout=60000)
     beats=page.evaluate('__beats');msgs=page.evaluate('__msgs')
     g,mx=gaps(beats)
-    over=sum(1 for x in g if x>200)
-    print('import heartbeat: n=%d max_gap=%.0fms gaps>200ms=%d msgs=%d'%(len(beats),mx,over,len(msgs)))
-    for m in msgs:
-        if '調べています' in m or '変換しています' in m or '上げています' in m:
-            print('  progress:',m)
+    print('import heartbeat: n=%d max_gap=%.0fms msgs=%d'%(len(beats),mx,len(msgs)))
     assert mx<200,('UI froze during import, max heartbeat gap %.0fms'%mx,mx)
     joined=' | '.join(msgs)
-    assert '音量を調べています… 1/3曲' in joined or '音量を調べています… 1/3曲 loud.mp3' in joined,msgs
-    assert any('音量を調べています…' in m and '/3曲' in m and '%' in m for m in msgs),msgs
-    assert any('変換しています…' in m and '/3曲' in m for m in msgs),msgs
-    assert any('音量を上げています…' in m and '/3曲' in m for m in msgs),msgs
+    assert '音量を調べています' not in joined and '変換しています' not in joined,msgs
     m=page.evaluate(MSG)
-    assert m.startswith('3曲を取り込みました') and '（うち1曲を44.1kHzステレオのMP3に変換しました）' in m and '（1曲の音量を上げました）' in m,m
+    assert m.startswith('3曲を取り込みました') and '形式と音量をそろえる' in m,m
+    L=page.evaluate(STORED,'loud');Q=page.evaluate(STORED,'quiet');S48=page.evaluate(STORED,'s48')
+    assert bytes(L['bytes'])==raw['loud'] and not L['meta'].get('loudChecked'),L['meta']
+    assert bytes(Q['bytes'])==raw['quiet'] and not S48['target']
+
+    # Button path does the analysis and stays responsive.
+    page.evaluate('__beats=[];__msgs=[]')
+    page.click('#convert')
+    page.wait_for_function("!document.getElementById('convert').disabled && "+MSG+".includes('音量を上げました')",timeout=120000)
+    beats=page.evaluate('__beats');msgs=page.evaluate('__msgs')
+    g,mx=gaps(beats)
+    print('convert heartbeat: n=%d max_gap=%.0fms gaps>200ms=%d'%(len(beats),mx,sum(1 for x in g if x>200)))
+    for x in msgs:
+        if '調べています' in x or 'そろえています' in x: print('  progress:',x)
+    assert mx<200,('UI froze during convert, max heartbeat gap %.0fms'%mx,mx)
+    assert any('音量を調べています…' in x and '/3曲' in x for x in msgs),msgs
+    m=page.evaluate(MSG)
+    assert '1曲を44.1kHzステレオのMP3にそろえました' in m and '1曲の音量を上げました' in m,m
     L=page.evaluate(STORED,'loud');Q=page.evaluate(STORED,'quiet');S48=page.evaluate(STORED,'s48')
     assert bytes(L['bytes'])==raw['loud'] and L['meta']['loudChecked']==1 and L['meta']['gainDb']==0,L['meta']
     assert Q['meta']['gainDb']==12 and Q['meta']['loudChecked']==1 and Q['target'],Q['meta']
     assert S48['target'] and S48['meta']['loudChecked']==1 and S48['meta']['gainDb']==0,S48['meta']
 
-    # Button path stays responsive and still skips already-checked songs.
+    # Second press: nothing to do.
     page.evaluate('__beats=[];__msgs=[]')
     page.click('#convert')
     page.wait_for_function(MSG+"==='そろえる必要がある曲はありません'",timeout=20000)
@@ -74,7 +84,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     print('second-press heartbeat max_gap=%.0fms'%mx)
     assert mx<200,mx
 
-    # Hung decodeAudioData: time out instead of freezing, then restore the original.
+    # Hung decodeAudioData: time out instead of freezing.
     hung=page.evaluate("""async (bytes) => {
       const keep=DECODE_TIMEOUT_MS; DECODE_TIMEOUT_MS=600;
       const ctx=audioCtx(); const orig=ctx.decodeAudioData.bind(ctx);
@@ -103,9 +113,9 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     }""",list(raw['s48']))
     print('resample fallback',fb)
     assert not fb['err'] and fb['sr']==44100 and fb['mode']!=3 and 7.5<fb['dur']<8.6,fb
-    assert 400<=fb['ms'],fb  # waited for the hung OfflineAudioContext before falling back
+    assert 400<=fb['ms'],fb
 
-    # CPU throttle (phone-like): heartbeat must still stay under ~200ms on a 12s quiet song.
+    # CPU throttle: convert a 12s quiet song with heartbeat < 200ms.
     q12=mp3(t,'q12',sine(440,10**(-30/20),12))
     ctx2=browser.new_context(service_workers='block')
     pg=ctx2.new_page();pg.on('pageerror',lambda e:errors.append(str(e)))
@@ -114,14 +124,20 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     cdp.send('Emulation.setCPUThrottlingRate',{'rate':4})
     pg.evaluate(HEART)
     pg.set_input_files('#file',[q12])
-    pg.wait_for_function("songs.length===1 && document.getElementById('msg').textContent.includes('取り込みました')",timeout=120000)
+    pg.wait_for_function("songs.length===1 && document.getElementById('msg').textContent.includes('取り込みました')",timeout=60000)
     beats=pg.evaluate('__beats');g,mx=gaps(beats)
-    print('cpu-x4 import heartbeat: n=%d max_gap=%.0fms gaps>200ms=%d'%(len(beats),mx,sum(1 for x in g if x>200)))
+    print('cpu-x4 import heartbeat max_gap=%.0fms'%mx)
+    assert mx<200,mx
+    assert '音量を上げました' not in pg.evaluate(MSG)
+    pg.evaluate('__beats=[]')
+    pg.click('#convert')
+    pg.wait_for_function("!document.getElementById('convert').disabled && "+MSG+".includes('1曲の音量を上げました')",timeout=120000)
+    beats=pg.evaluate('__beats');g,mx=gaps(beats)
+    print('cpu-x4 convert heartbeat: n=%d max_gap=%.0fms gaps>200ms=%d'%(len(beats),mx,sum(1 for x in g if x>200)))
     assert mx<200,('throttled UI froze, max heartbeat gap %.0fms'%mx,mx)
-    assert '（1曲の音量を上げました）' in pg.evaluate(MSG),pg.evaluate(MSG)
     ctx2.close()
 
     assert not errors,errors
-    print('PASS v17: import stays responsive (heartbeat gap < 200ms, also under 4x CPU throttle), per-song progress (音量を調べています… N/10曲), quiet song boosted once, loud song byte-identical, hung decode times out, hung OfflineAudioContext falls back to linear resample, second convert is a no-op')
+    print('PASS v17: import stores as-is and stays responsive; button loudness/convert stays responsive (also under 4x CPU), per-song progress, quiet song boosted once, loud song byte-identical, hung decode times out, hung OfflineAudioContext falls back, second convert is a no-op')
     browser.close()
 server.shutdown()

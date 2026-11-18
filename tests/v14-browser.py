@@ -31,7 +31,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v17'
+    assert page.locator('#ver').inner_text()=='v18'
     assert page.locator('#convert').inner_text()=='形式と音量をそろえる'
     assert page.evaluate("getComputedStyle(document.getElementById('convert')).minHeight")=='64px'
     # Encoder output: 44.1kHz MPEG-1, 2ch never mono; record lamejs channel mode.
@@ -47,15 +47,23 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
       await actx.close();actx=keep;return res}""",list(raw['s48']))
     for k in ('offline','linear'):
         assert fb[k]['sr']==44100 and fb[k]['mode']!=3 and 1.9<fb[k]['dur']<2.3,fb
-    # Empty library import: every song normalized, joined into one chunk, cur===0.
+    # Empty library import: store as-is (no convert/loudness), then the button normalizes.
     page.set_input_files('#file',[s44,s48,m44,v22,m4a])
     page.wait_for_function("songs.length===5 && cur===0 && !loadJob && audio.readyState>=1",timeout=90000)
+    info=page.evaluate(INSPECT,None)
+    assert info['s44']['size']==len(raw['s44']) and info['s44']['bytes']==list(raw['s44'][:64]),'44.1k stereo mp3 must stay byte-identical'
+    assert not info['s48']['target'] and info['s48']['sr']==48000,info['s48']
+    assert not info['m44']['target'] and not info['v22']['target'] and not info['song']['target']
+    m=page.evaluate(MSG)
+    assert m.startswith('5曲を取り込みました') and '形式と音量をそろえる' in m and '変換しました' not in m,m
+    assert page.evaluate('audio.paused')
+    page.click('#convert')
+    page.wait_for_function("!document.getElementById('convert').disabled && "+MSG+".includes('曲を44.1kHzステレオのMP3にそろえました')",timeout=90000)
     page.wait_for_function("C && C.segs.length===5",timeout=20000)
     info=page.evaluate(INSPECT,None)
     assert info['s44']['size']==len(raw['s44']) and info['s44']['bytes']==list(raw['s44'][:64]),'44.1k stereo mp3 must stay byte-identical'
     for k in ('s48','m44','v22','song'):
         x=info[k];assert x['target'] and x['type']=='audio/mpeg' and x['sr']==44100 and x['v']==3 and x['mode']!=3 and x['size']==x['meta'] and 1.8<x['dur']<2.5,(k,x)
-    assert '5曲を取り込みました（うち4曲を44.1kHzステレオのMP3に変換しました）' in page.evaluate(MSG),page.evaluate(MSG)
     assert page.evaluate('audio.paused')
     # Pre-v14 library: raw non-target files stored as-is, then the button.
     page.evaluate("""async (items) => {
@@ -87,19 +95,24 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.wait_for_function("songs.length===11 && "+MSG+".includes('曲を取り込みました')",timeout=60000)
     r2=page.evaluate("""async () => {const s=songs[10];const b=await tx('blobs','readonly',st=>st.get(s.id));
       return {target:isTargetMp3(new Uint8Array(b.buf)),cur,msg:document.getElementById('msg').textContent,title:document.getElementById('title').textContent}}""")
-    assert r2['target'] and r2['cur']==-1 and r2['title']=='曲を選んでください' and 'うち1曲を44.1kHzステレオのMP3に変換しました' in r2['msg'],r2
+    assert (not r2['target']) and r2['cur']==-1 and r2['title']=='曲を選んでください' and '形式と音量をそろえる' in r2['msg'],r2
+    page.click('#convert')
+    page.wait_for_function("!document.getElementById('convert').disabled && "+MSG+".includes('曲を44.1kHzステレオのMP3にそろえました')",timeout=60000)
     page.evaluate("load(0,false)")
     page.wait_for_function("!loadJob && C && C.segs.length===11",timeout=20000)
     # Offline: encoder from SW cache; normalizes a 48k MP3.
     ctx2=browser.new_context();pg=ctx2.new_page();pg.on('pageerror',lambda e:errors.append(str(e)))
     pg.goto(url);pg.wait_for_function('window.__ready');pg.wait_for_function('navigator.serviceWorker.controller!==null',timeout=20000)
     ctx2.set_offline(True);pg.reload();pg.wait_for_function('window.__ready')
-    assert pg.locator('#ver').inner_text()=='v17'
+    assert pg.locator('#ver').inner_text()=='v18'
     pg.set_input_files('#file',[s48,s44])
-    pg.wait_for_function("songs.length===2 && cur===0 && !loadJob && C && C.segs.length===2",timeout=60000)
-    assert 'うち1曲を44.1kHzステレオのMP3に変換しました' in pg.evaluate(MSG)
+    pg.wait_for_function("songs.length===2 && cur===0 && !loadJob && "+MSG+".includes('曲を取り込みました')",timeout=60000)
+    assert '形式と音量をそろえる' in pg.evaluate(MSG)
+    pg.click('#convert')
+    pg.wait_for_function("!document.getElementById('convert').disabled && C && C.segs.length===2",timeout=60000)
+    assert '曲を44.1kHzステレオのMP3にそろえました' in pg.evaluate(MSG)
     ctx2.close()
     assert not errors,errors
-    print('PASS v14: 48k/mono/MPEG-2 MP3 + m4a normalized to 44.1kHz stereo MPEG-1 on import and by button, 44.1k stereo MP3 byte-identical, single joined chunk across all songs, order/titles kept, no autoplay, nothing-to-do message, 48k-context resample (Offline + linear), idle add no autoload, empty-library cur===0, offline')
+    print('PASS v14: import stores as-is, button normalizes 48k/mono/MPEG-2 MP3 + m4a to 44.1kHz stereo MPEG-1, 44.1k stereo MP3 byte-identical, single joined chunk across all songs, order/titles kept, no autoplay, nothing-to-do message, 48k-context resample (Offline + linear), idle add no autoload, empty-library cur===0, offline')
     browser.close()
 server.shutdown()

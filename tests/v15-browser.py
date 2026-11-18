@@ -44,14 +44,20 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v17'
+    assert page.locator('#ver').inner_text()=='v18'
     assert page.locator('#convert').inner_text()=='形式と音量をそろえる'
     assert page.evaluate("getComputedStyle(document.getElementById('convert')).minHeight")=='64px'
-    # Import path (empty library): quiet + peaky boosted, loud byte-identical, all joined, cur===0.
+    # Import path: store as-is (no loudness yet). Already-target MP3s still join. Then the button boosts.
     page.set_input_files('#file',[loud,quiet,peaky])
     page.wait_for_function("songs.length===3 && cur===0 && !loadJob && C && C.segs.length===3",timeout=90000)
     m=page.evaluate(MSG)
-    assert m.startswith('3曲を取り込みました') and '（2曲の音量を上げました）' in m,m
+    assert m.startswith('3曲を取り込みました') and '形式と音量をそろえる' in m and '音量を上げました' not in m,m
+    assert page.evaluate('audio.paused')
+    assert bytes(page.evaluate(STORED,'loud')['bytes'])==raw['loud']
+    assert bytes(page.evaluate(STORED,'quiet')['bytes'])==raw['quiet']
+    assert bytes(page.evaluate(STORED,'peaky')['bytes'])==raw['peaky']
+    page.click('#convert')
+    page.wait_for_function("!document.getElementById('convert').disabled && "+MSG+".includes('2曲の音量を上げました')",timeout=90000)
     assert page.evaluate('audio.paused')
     L=page.evaluate(STORED,'loud');Q=page.evaluate(STORED,'quiet');P=page.evaluate(STORED,'peaky')
     assert bytes(L['bytes'])==raw['loud'] and L['meta']['loudChecked']==1 and L['meta']['gainDb']==0,'loud song must stay byte-identical'
@@ -103,16 +109,18 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     assert bytes(page.evaluate(STORED,'昔大きい2')['bytes'])==raw['loud']
     page.evaluate("() => { load(0,false) }")  # injected song was added behind the app's back; rejoin
     page.wait_for_function("!loadJob && C && C.segs.length===7",timeout=20000)
-    # Offline: import boosts using the SW-cached encoder.
+    # Offline: button boosts using the SW-cached encoder.
     ctx2=browser.new_context();pg=ctx2.new_page();pg.on('pageerror',lambda e:errors.append(str(e)))
     pg.goto(url);pg.wait_for_function('window.__ready');pg.wait_for_function('navigator.serviceWorker.controller!==null',timeout=20000)
     ctx2.set_offline(True);pg.reload();pg.wait_for_function('window.__ready')
-    assert pg.locator('#ver').inner_text()=='v17'
+    assert pg.locator('#ver').inner_text()=='v18'
     pg.set_input_files('#file',[quiet,loud])
     pg.wait_for_function("songs.length===2 && cur===0 && !loadJob && C && C.segs.length===2",timeout=60000)
-    assert '（1曲の音量を上げました）' in pg.evaluate(MSG),pg.evaluate(MSG)
+    assert '音量を上げました' not in pg.evaluate(MSG),pg.evaluate(MSG)
+    pg.click('#convert')
+    pg.wait_for_function("!document.getElementById('convert').disabled && "+MSG+".includes('1曲の音量を上げました')",timeout=60000)
     ctx2.close()
     assert not errors,errors
-    print('PASS v15: quiet song boosted (+12 dB cap, peak <= -1 dBFS, no clipping), loud song byte-identical, peaky song soft-limited, button converts+boosts pre-v15 songs once (same id/order, no autoplay), second press no-op, analysis-only message, all songs one chunk, import boost, offline')
+    print('PASS v15: import stores as-is, button boosts quiet song (+12 dB cap, peak <= -1 dBFS, no clipping), loud song byte-identical, peaky song soft-limited, button converts+boosts pre-v15 songs once (same id/order, no autoplay), second press no-op, analysis-only message, all songs one chunk, offline')
     browser.close()
 server.shutdown()

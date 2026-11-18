@@ -61,9 +61,10 @@ function audioCtx(){
  try{actx=new A({sampleRate:TARGET_SR})}catch(e){try{actx=new A()}catch(e2){actx=null}}
  return actx;
 }
-let DECODE_TIMEOUT_MS=90000,RESAMPLE_TIMEOUT_MS=90000;
-let lastYield=0,lastPaint=0;
+let DECODE_TIMEOUT_MS=90000,RESAMPLE_TIMEOUT_MS=90000,SEGMENT_SEC=30;
+let lastYield=0,lastPaint=0,cancelWork=false;
 const tick=()=>new Promise(r=>setTimeout(r,0));
+function throwIfCancelled(){if(cancelWork)throw new Error('中止')}
 function withTimeout(p,ms,err){
  let t;
  return Promise.race([
@@ -73,9 +74,11 @@ function withTimeout(p,ms,err){
 }
 // Yield so iPhone Safari can paint progress and stay responsive during long JS loops.
 async function yieldUi(force){
+ throwIfCancelled();
  const now=performance.now();
  if(!force&&now-lastYield<24)return;
  lastYield=now;await tick();
+ throwIfCancelled();
 }
 async function msgProgress(t){
  $('msg').textContent=t;
@@ -85,6 +88,11 @@ async function msgProgress(t){
   await new Promise(r=>requestAnimationFrame(()=>setTimeout(r,0)));
  }else await tick();
  lastYield=performance.now();
+ throwIfCancelled();
+}
+function showWork(on){
+ const c=$('cancel'),b=$('convert');
+ if(c)c.hidden=!on;if(b)b.disabled=on;
 }
 // Bring any decoded buffer to TARGET_SR. Old iOS may refuse a 44.1kHz AudioContext
 // (decodeAudioData then returns the device rate, e.g. 48kHz).
@@ -92,14 +100,17 @@ async function resampleTo(ab,rate){
  if(ab.sampleRate===rate)return ab;
  const nch=Math.min(ab.numberOfChannels,2),len=Math.max(1,Math.ceil(ab.duration*rate));
  const O=window.OfflineAudioContext||window.webkitOfflineAudioContext;
- if(O){try{
+ // One OfflineAudioContext of a long song can exhaust iPhone memory; only use it for short buffers.
+ if(O&&ab.duration<=SEGMENT_SEC){try{
   const oc=new O(nch,len,rate),src=oc.createBufferSource();
   // >2 channels are downmixed by Web Audio's speaker rules (keeps center/surround).
   src.buffer=ab;src.connect(oc.destination);src.start(0);
-  const render=new Promise((res,rej)=>{let p;oc.oncomplete=e=>res(e.renderedBuffer);
-   try{p=oc.startRendering()}catch(e){rej(e);return}if(p&&p.then)p.then(res,rej)});
-  const out=await withTimeout(render,RESAMPLE_TIMEOUT_MS,'44.1kHzへの変換が時間切れになりました');
-  if(out&&out.sampleRate===rate&&out.length)return out;
+  try{
+   const render=new Promise((res,rej)=>{let p;oc.oncomplete=e=>res(e.renderedBuffer);
+    try{p=oc.startRendering()}catch(e){rej(e);return}if(p&&p.then)p.then(res,rej)});
+   const out=await withTimeout(render,RESAMPLE_TIMEOUT_MS,'44.1kHzへの変換が時間切れになりました');
+   if(out&&out.sampleRate===rate&&out.length)return out;
+  }finally{try{if(oc.close)oc.close()}catch(e){}}
  }catch(e){console.warn(e)}}
  // Fallback: linear interpolation per channel.
  const ratio=ab.sampleRate/rate,chans=[];
@@ -127,24 +138,43 @@ function kWeight(fs){
  const rlb=biquad(1,-2,1,2*(K*K-1)/d,(1-K/Q+K*K)/d);
  return x=>rlb(pre(x));
 }
-async function measureLoudness(L,R,fs,onPct){
- const fl=kWeight(fs),fr=kWeight(fs),step=Math.round(fs/10),len=L.length,sub=[];let peak=0;
- for(let o=0;o<len;o+=step){const e=Math.min(len,o+step);let s=0;
-  for(let i=o;i<e;i++){const l=L[i],r=R[i],a=l<0?-l:l,b=r<0?-r:r;if(a>peak)peak=a;if(b>peak)peak=b;
-   const x=fl(l),y=fr(r);s+=x*x+y*y}
-  sub.push(s/step);
-  if(performance.now()-lastYield>=24||o+step>=len){
-   if(onPct)await onPct(Math.min(100,Math.floor(100*Math.min(o+step,len)/len)));
-   else await yieldUi(true);
-  }
+function loudnessAcc(fs){return{fl:kWeight(fs),fr:kWeight(fs),step:Math.round(fs/10),sub:[],peak:0,restL:null,restR:null,seen:0}}
+async function loudnessPush(acc,L,R,onPct,totalHint){
+ const fl=acc.fl,fr=acc.fr,step=acc.step;
+ let L0=L,R0=R;
+ if(acc.restL&&acc.restL.length){
+  const p=acc.restL.length,n=p+L.length,a=new Float32Array(n),b=new Float32Array(n);
+  a.set(acc.restL);a.set(L,p);b.set(acc.restR);b.set(R,p);L0=a;R0=b;acc.restL=acc.restR=null;
  }
- const blocks=[];for(let k=0;k+4<=sub.length;k++){blocks.push((sub[k]+sub[k+1]+sub[k+2]+sub[k+3])/4);if((k&16383)===16383)await yieldUi()}
- if(!blocks.length&&sub.length)blocks.push(sub.reduce((a,b)=>a+b,0)*step/len);
+ let o=0,len=L0.length;
+ for(;o+step<=len;o+=step){let s=0;const e=o+step;
+  for(let i=o;i<e;i++){const l=L0[i],r=R0[i],ap=l<0?-l:l,bp=r<0?-r:r;if(ap>acc.peak)acc.peak=ap;if(bp>acc.peak)acc.peak=bp;
+   const x=fl(l),y=fr(r);s+=x*x+y*y}
+  acc.sub.push(s/step);acc.seen+=step;
+  if(performance.now()-lastYield>=24){if(onPct&&totalHint)await onPct(Math.min(99,Math.floor(100*acc.seen/totalHint)));else await yieldUi(true)}
+ }
+ if(o<len){acc.restL=L0.subarray(o);acc.restR=R0.subarray(o)}
+}
+function loudnessFinish(acc){
+ if(acc.restL&&acc.restL.length){
+  const L=acc.restL,R=acc.restR,fl=acc.fl,fr=acc.fr;let s=0;
+  for(let i=0;i<L.length;i++){const l=L[i],r=R[i],ap=l<0?-l:l,bp=r<0?-r:r;if(ap>acc.peak)acc.peak=ap;if(bp>acc.peak)acc.peak=bp;
+   const x=fl(l),y=fr(r);s+=x*x+y*y}
+  acc.sub.push(s/Math.max(1,L.length));acc.restL=acc.restR=null;
+ }
+ const sub=acc.sub,step=acc.step,blocks=[];
+ for(let k=0;k+4<=sub.length;k++)blocks.push((sub[k]+sub[k+1]+sub[k+2]+sub[k+3])/4);
+ if(!blocks.length&&sub.length)blocks.push(sub.reduce((a,b)=>a+b,0)*step/Math.max(1,acc.seen||step));
  const lu=e=>-0.691+10*Math.log10(e),mean=a=>a.reduce((x,y)=>x+y,0)/a.length;
  const abs=blocks.filter(e=>e>0&&lu(e)>-70);
  let lufs=-Infinity;
  if(abs.length){const rel=lu(mean(abs))-10,g=abs.filter(e=>lu(e)>rel);lufs=lu(mean(g.length?g:abs))}
- return{lufs,peakDb:peak>0?20*Math.log10(peak):-Infinity};
+ return{lufs,peakDb:acc.peak>0?20*Math.log10(acc.peak):-Infinity};
+}
+async function measureLoudness(L,R,fs,onPct){
+ const acc=loudnessAcc(fs);
+ await loudnessPush(acc,L,R,onPct,L.length);
+ return loudnessFinish(acc);
 }
 // Boost in dB (0 = leave as is). Only quiet songs are raised; loud ones are never turned down.
 function boostFor(m){
@@ -152,6 +182,16 @@ function boostFor(m){
  let g=Math.min(TARGET_LUFS-m.lufs,MAX_BOOST_DB);if(g<MIN_BOOST_DB)return 0;
  g=Math.min(g,CEILING_DB-m.peakDb+MAX_LIMIT_DB); // Limiter takes at most MAX_LIMIT_DB off any peak.
  return g>=MIN_BOOST_DB?Math.round(g*10)/10:0;
+}
+async function limiterEnvFromReq(req,any,fs){
+ if(!any)return null;
+ const nb=req.length-1,env=new Float32Array(nb+1);
+ // Neighbour minimum keeps the interpolated gain under each block's requirement.
+ for(let b=0;b<=nb;b++){env[b]=Math.min(req[b],b>0?req[b-1]:1,b<nb?req[b+1]:1);if((b&16383)===16383)await yieldUi()}
+ const att=1/Math.max(1,Math.round(0.010*fs/32)),rel=1/Math.max(1,Math.round(0.150*fs/32));
+ for(let b=nb-1;b>=0;b--){env[b]=Math.min(env[b],env[b+1]+att);if((b&16383)===16383)await yieldUi()}
+ for(let b=1;b<=nb;b++){env[b]=Math.min(env[b],env[b-1]+rel);if((b&16383)===16383)await yieldUi()}
+ return env;
 }
 // Per-32-sample gain envelope (<=1) so |x*gain*env| never exceeds the ceiling:
 // 10ms look-ahead attack, 150ms release, linear between blocks. No hard clipping.
@@ -162,16 +202,23 @@ async function limiterEnv(L,R,gain,fs){
   for(let i=b*B;i<e;i++){const a=Math.abs(L[i]),c=Math.abs(R[i]);if(a>pk)pk=a;if(c>pk)pk=c}
   const r=pk*gain>ceil?ceil/(pk*gain):1;req[b]=r;if(r<1)any=true;
   if((b&2047)===2047)await yieldUi()}
+ req[nb]=req[nb-1];
+ return limiterEnvFromReq(req,any,fs);
+}
+async function limiterEnvFromPeaks(pks,gain,fs){
+ const nb=pks.length,ceil=Math.pow(10,CEILING_DB/20),req=new Float32Array(nb+1);
+ let any=false;
+ for(let b=0;b<nb;b++){const r=pks[b]*gain>ceil?ceil/(pks[b]*gain):1;req[b]=r;if(r<1)any=true;
+  if((b&2047)===2047)await yieldUi()}
  if(!any)return null;
  req[nb]=req[nb-1];
- const env=new Float32Array(nb+1);
- // Neighbour minimum keeps the interpolated gain under each block's requirement.
- for(let b=0;b<=nb;b++){env[b]=Math.min(req[b],b>0?req[b-1]:1,b<nb?req[b+1]:1);if((b&16383)===16383)await yieldUi()}
- const att=1/Math.max(1,Math.round(0.010*fs/B)),rel=1/Math.max(1,Math.round(0.150*fs/B));
- for(let b=nb-1;b>=0;b--){env[b]=Math.min(env[b],env[b+1]+att);if((b&16383)===16383)await yieldUi()}
- for(let b=1;b<=nb;b++){env[b]=Math.min(env[b],env[b-1]+rel);if((b&16383)===16383)await yieldUi()}
- return env;
+ return limiterEnvFromReq(req,true,fs);
 }
+function PeakCol(){this.pk=[];this.cur=0;this.n=0}
+PeakCol.prototype.push=function(L,R){
+ for(let i=0;i<L.length;i++){const a=L[i]<0?-L[i]:L[i],c=R[i]<0?-R[i]:R[i],p=a>c?a:c;if(p>this.cur)this.cur=p;this.n++;if((this.n&31)===0){this.pk.push(this.cur);this.cur=0}}
+};
+PeakCol.prototype.finish=function(){if(this.n&31)this.pk.push(this.cur);return this.pk};
 // Stereo view of a decoded buffer: mono shares one array; >2ch mixed (even->L, odd->R).
 async function stereoPcm(ab){
  const nch=ab.numberOfChannels,ch=[];for(let c=0;c<nch;c++)ch.push(ab.getChannelData(c));
@@ -181,10 +228,107 @@ async function stereoPcm(ab){
  for(let i=0;i<len;i++){L[i]/=nl;R[i]/=nr;if((i&16383)===16383)await yieldUi()}
  return{L,R};
 }
-async function decodeRaw(ctx,raw){
+// Copy only the bytes we are about to decode (decodeAudioData detaches its input).
+async function decodeBytes(ctx,bytes){
+ throwIfCancelled();
+ const copy=bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength);
  return withTimeout(new Promise((res,rej)=>{let p;
-  try{p=ctx.decodeAudioData(raw.slice(0),res,e=>rej(e||new Error('decode')))}catch(e){rej(e);return}
+  try{p=ctx.decodeAudioData(copy,res,e=>rej(e||new Error('decode')))}catch(e){rej(e);return}
   if(p&&p.then)p.then(res,rej)}),DECODE_TIMEOUT_MS,'音声の読み込みが時間切れになりました');
+}
+async function decodeRaw(ctx,raw){
+ const u=raw instanceof Uint8Array?raw:new Uint8Array(raw);
+ return decodeBytes(ctx,u);
+}
+async function pcmToTarget(L,R,sr){
+ if(sr===TARGET_SR)return{L,R};
+ const len=Math.max(1,Math.round(L.length*TARGET_SR/sr)),ratio=sr/TARGET_SR;
+ const oL=new Float32Array(len),oR=new Float32Array(len);
+ for(let i=0;i<len;i++){const x=i*ratio,k=Math.floor(x),f=x-k,a=Math.min(k,L.length-1),b=Math.min(k+1,L.length-1);
+  oL[i]=L[a]+(L[b]-L[a])*f;oR[i]=R[a]+(R[b]-R[a])*f;if((i&8191)===8191)await yieldUi()}
+ return{L:oL,R:oR};
+}
+function mp3Slice(u,parsed,i,j){
+ const start=parsed.start+parsed.offsets[i];
+ const end=j<parsed.offsets.length?parsed.start+parsed.offsets[j]:parsed.end;
+ return u.subarray(start,end);
+}
+async function decodeMp3Frames(ctx,u,parsed,i,j){
+ throwIfCancelled();
+ let ab=await decodeBytes(ctx,mp3Slice(u,parsed,i,j));
+ if(!ab||!ab.length)throw new Error('音声が空です');
+ const sr=ab.sampleRate;let {L,R}=await stereoPcm(ab);ab=null;
+ const expect=Math.max(1,Math.round((j-i)*parsed.smp*(sr/parsed.sr)));
+ let delay=0;
+ if(L.length>expect){const typ=Math.round(528*(sr/parsed.sr));delay=Math.min(L.length-expect,typ)}
+ return{L,R,sr,delay};
+}
+function uniquePcm(dec,parsed,from,to,decFrom){
+ const scale=dec.sr/parsed.sr,smp=parsed.smp;
+ const start=dec.delay+Math.round((from-decFrom)*smp*scale);
+ const count=Math.round((to-from)*smp*scale);
+ const a=Math.max(0,start),b=Math.min(dec.L.length,Math.max(a,start+count));
+ return{L:dec.L.subarray(a,b),R:dec.R.subarray(a,b),sr:dec.sr};
+}
+const s16=v=>v<=-1?-32768:v>=1?32767:Math.round(v<0?v*32768:v*32767);
+async function encodePcm(L,R,gainDb,env,onPct,sampleBase,totalHint){
+ const len=L.length,g=Math.pow(10,(gainDb||0)/20),BLOCK=1152*32,EB=32,OL=new Int16Array(BLOCK),OR=new Int16Array(BLOCK),out=[];
+ const enc=arguments[7]||new lamejs.Mp3Encoder(2,TARGET_SR,192);
+ const own=!arguments[7];
+ for(let o=0;o<len;o+=BLOCK){
+  const n=Math.min(BLOCK,len-o);
+  for(let i=0;i<n;i++){const k=(sampleBase||0)+o+i;let a=g;
+   if(env){const b=(k/EB)|0,f=(k-b*EB)/EB,e0=env[Math.min(b,env.length-1)],e1=env[Math.min(b+1,env.length-1)];a*=e0+(e1-e0)*f}
+   OL[i]=s16(L[o+i]*a);OR[i]=s16(R[o+i]*a);
+   if((i&8191)===8191)await yieldUi()}
+  for(let f=0;f<n;f+=1152){const e=Math.min(n,f+1152);
+   const mm=enc.encodeBuffer(OL.subarray(f,e),OR.subarray(f,e));if(mm.length)out.push(new Uint8Array(mm.buffer,mm.byteOffset,mm.length));
+   if(performance.now()-lastYield>=24){if(onPct)await onPct('encode',Math.floor(100*Math.min(1,((sampleBase||0)+o+f)/(totalHint||len))));else await yieldUi(true)}}
+ }
+ return{enc,out,own};
+}
+async function processMp3Segments(ctx,u,parsed,{format,loud},onPct){
+ const nF=parsed.offsets.length,fPer=Math.max(1,Math.round(SEGMENT_SEC*parsed.sr/parsed.smp));
+ const over=Math.max(1,Math.round(0.5*parsed.sr/parsed.smp));
+ const totalEst=Math.round(parsed.dur*TARGET_SR);
+ const acc=loud?loudnessAcc(TARGET_SR):null,peaks=new PeakCol();
+ let samplePos=0;
+ const segs=[];
+ for(let a=0;a<nF;a+=fPer)segs.push([a,Math.min(nF,a+fPer)]);
+ async function segmentPcm(a,b){
+  const d0=Math.max(0,a-over),d1=Math.min(nF,b+1);
+  const dec=await decodeMp3Frames(ctx,u,parsed,d0,d1);
+  const uq=uniquePcm(dec,parsed,a,b,d0);
+  dec.L=dec.R=null;
+  return pcmToTarget(uq.L,uq.R,uq.sr);
+ }
+ if(loud){
+  for(let s=0;s<segs.length;s++){
+   if(onPct)await onPct('measure',Math.floor(100*s/segs.length));
+   const {L,R}=await segmentPcm(segs[s][0],segs[s][1]);
+   await loudnessPush(acc,L,R,p=>onPct&&onPct('measure',p),totalEst);
+   peaks.push(L,R);samplePos+=L.length;L.fill(0);R.fill(0);
+   await yieldUi(true);
+  }
+ }
+ const m=loud?loudnessFinish(acc):{lufs:null,peakDb:null},gainDb=loud?boostFor(m):0;
+ if(!format&&!gainDb)return{buf:null,lufs:m.lufs,peakDb:m.peakDb,gainDb:0};
+ if(!window.lamejs||!lamejs.Mp3Encoder)throw new Error('変換プログラムが読み込まれていません');
+ const env=gainDb?await limiterEnvFromPeaks(peaks.finish(),Math.pow(10,gainDb/20),TARGET_SR):null;
+ const enc=new lamejs.Mp3Encoder(2,TARGET_SR,192),chunks=[];
+ let pos=0;
+ for(let s=0;s<segs.length;s++){
+  if(onPct)await onPct('encode',Math.floor(100*s/segs.length));
+  const {L,R}=await segmentPcm(segs[s][0],segs[s][1]);
+  const part=await encodePcm(L,R,gainDb,env,onPct,pos,totalEst,enc);
+  chunks.push.apply(chunks,part.out);pos+=L.length;L.fill(0);R.fill(0);
+  await yieldUi(true);
+ }
+ if(onPct)await onPct('encode',100);
+ const mm=enc.flush();if(mm.length)chunks.push(new Uint8Array(mm.buffer,mm.byteOffset,mm.length));
+ const buf=await new Blob(chunks,{type:'audio/mpeg'}).arrayBuffer();chunks.length=0;
+ if(!isTargetMp3(new Uint8Array(buf)))throw new Error('変換結果が44.1kHzステレオのMP3になりませんでした');
+ return{buf,lufs:m.lufs,peakDb:m.peakDb,gainDb};
 }
 // Decode, optionally measure loudness, and encode a 192kbps 44.1kHz stereo MP3 with the
 // boost baked in. format: must re-encode (not target MP3). loud: analyze loudness.
@@ -193,8 +337,13 @@ async function processAudio(raw,{format=true,loud=true}={},onPct){
  if(format&&(!window.lamejs||!lamejs.Mp3Encoder))throw new Error('変換プログラムが読み込まれていません');
  const ctx=audioCtx();if(!ctx)throw new Error('この端末では変換できません');
  if(ctx.state==='suspended'){try{await ctx.resume()}catch(e){}}
- // decodeAudioData detaches its input, and old Safari only has the callback form.
- let ab=await decodeRaw(ctx,raw);
+ const u=raw instanceof Uint8Array?raw:new Uint8Array(raw);
+ const parsed=isMp3(u)?parseMp3(u):null;
+ if(parsed&&parsed.dur>MAX_CONVERT_SEC)throw new Error('長すぎる');
+ // Long MP3s: decode ~30s frame slices so iOS never holds the whole PCM at once.
+ if(parsed&&parsed.offsets.length&&parsed.dur>SEGMENT_SEC)
+  return processMp3Segments(ctx,u,parsed,{format,loud},onPct);
+ let ab=await decodeBytes(ctx,u);
  if(!ab||!ab.length)throw new Error('音声が空です');
  ab=await resampleTo(ab,TARGET_SR);
  if(ab.sampleRate!==TARGET_SR||!ab.length)throw new Error('44.1kHzにできませんでした');
@@ -203,39 +352,31 @@ async function processAudio(raw,{format=true,loud=true}={},onPct){
  if(loud){m=await measureLoudness(L,R,TARGET_SR,p=>onPct&&onPct('measure',p));gainDb=boostFor(m)}
  if(!format&&!gainDb){L=R=null;return{buf:null,lufs:m.lufs,peakDb:m.peakDb,gainDb:0}}
  if(!window.lamejs||!lamejs.Mp3Encoder)throw new Error('変換プログラムが読み込まれていません');
- const g=Math.pow(10,gainDb/20),env=gainDb?await limiterEnv(L,R,g,TARGET_SR):null;
- // Always 2 channels: mono is copied to both sides, so the output is never mode 3 (mono).
- const enc=new lamejs.Mp3Encoder(2,TARGET_SR,192);
- const BLOCK=1152*32,EB=32,OL=new Int16Array(BLOCK),OR=new Int16Array(BLOCK),out=[];
- const s16=v=>v<=-1?-32768:v>=1?32767:Math.round(v<0?v*32768:v*32767);
- for(let o=0;o<len;o+=BLOCK){
-  const n=Math.min(BLOCK,len-o);
-  for(let i=0;i<n;i++){const k=o+i;let a=g;
-   if(env){const b=(k/EB)|0,f=(k-b*EB)/EB;a*=env[b]+(env[b+1]-env[b])*f}
-   OL[i]=s16(L[k]*a);OR[i]=s16(R[k]*a)
-   if((i&8191)===8191)await yieldUi()}
-  // Encode in 1152-sample MP3 frames.
-  for(let f=0;f<n;f+=1152){const e=Math.min(n,f+1152);
-   const mm=enc.encodeBuffer(OL.subarray(f,e),OR.subarray(f,e));if(mm.length)out.push(new Uint8Array(mm.buffer,mm.byteOffset,mm.length));
-   if(performance.now()-lastYield>=24){if(onPct)await onPct('encode',Math.floor(100*(o+f)/len));else await yieldUi(true)}}
- }
- if(onPct)await onPct('encode',100);
- const mm=enc.flush();if(mm.length)out.push(new Uint8Array(mm.buffer,mm.byteOffset,mm.length));
- L=R=null; // Drop the decoded PCM early.
- const buf=await new Blob(out,{type:'audio/mpeg'}).arrayBuffer();out.length=0;
+ const env=gainDb?await limiterEnv(L,R,Math.pow(10,gainDb/20),TARGET_SR):null;
+ const part=await encodePcm(L,R,gainDb,env,onPct,0,len);
+ if(part.own){const mm=part.enc.flush();if(mm.length)part.out.push(new Uint8Array(mm.buffer,mm.byteOffset,mm.length))}
+ L=R=null;
+ const buf=await new Blob(part.out,{type:'audio/mpeg'}).arrayBuffer();part.out.length=0;
  if(!isTargetMp3(new Uint8Array(buf)))throw new Error('変換結果が44.1kHzステレオのMP3になりませんでした');
  return{buf,lufs:m.lufs,peakDb:m.peakDb,gainDb};
 }
 async function toMp3(raw,onPct){return (await processAudio(raw,{format:true,loud:false},(k,p)=>onPct&&onPct(p))).buf}
-// One job at a time (import and button) to limit iPhone memory.
+// One job at a time to limit iPhone memory.
 function processOne(raw,opts,onPct){const job=encQ.then(()=>processAudio(raw,opts,onPct));encQ=job.catch(()=>{});return job}
 const loudMeta=r=>({loudChecked:LOUD_VERSION,lufs:Number.isFinite(r.lufs)?Math.round(r.lufs*10)/10:null,gainDb:r.gainDb||0});
+const IMPORT_HINT='。形式や音量をそろえる場合は「形式と音量をそろえる」を押してください';
 async function convertLibrary(){
- const btn=$('convert');if(btn.disabled)return;btn.disabled=true;
+ const btn=$('convert');if(btn.disabled)return;
+ cancelWork=false;
+ // Resume inside the tap gesture; awaiting IndexedDB first would drop it on iOS.
+ const ctx=audioCtx();if(ctx&&ctx.state==='suspended'){try{ctx.resume()}catch(e){}}
+ showWork(true);
+ let stopped=false;
  try{
   msg('形式と音量を調べる曲を探しています…');
   const todo=[];
   for(const s of songs.slice()){
+   throwIfCancelled();
    const b=await tx('blobs','readonly',st=>st.get(s.id));if(!b)continue;
    const u=new Uint8Array(b instanceof Blob?await b.arrayBuffer():b.buf);
    const type=b.type||'';
@@ -268,15 +409,22 @@ async function convertLibrary(){
     }
     await tx('meta','readwrite',st=>st.put(meta));
     Object.assign(now,meta);
-   }catch(e){console.warn(e);failed.push(s.title)}
+   }catch(e){
+    if(e&&e.message==='中止'){stopped=true;break}
+    console.warn(e);failed.push(s.title)
+   }
    await yieldUi(true);
   }
   const parts=[];
   if(fmtN)parts.push(fmtN+'曲を44.1kHzステレオのMP3にそろえました');
   if(boostN)parts.push(boostN+'曲の音量を上げました');
-  if(!parts.length)parts.push(failed.length?'そろえられた曲はありません':'音量を調べました。変える必要がある曲はありませんでした');
-  let t=parts.join('。');
-  if(failed.length)t+='（そろえられなかった曲: '+failed.join('、')+'。Apple Musicなど保護された曲や長すぎる曲は元のまま残しています）';
+  let t;
+  if(stopped)t='中止しました'+(parts.length?'（'+parts.join('。')+'）':'');
+  else{
+   if(!parts.length)parts.push(failed.length?'そろえられた曲はありません':'音量を調べました。変える必要がある曲はありませんでした');
+   t=parts.join('。');
+   if(failed.length)t+='（そろえられなかった曲: '+failed.join('、')+'。Apple Musicなど保護された曲や長すぎる曲は元のまま残しています）';
+  }
   const done=fmtN+boostN;
   render();usage();makeOrder();dropPre();
   if(done&&cur>=0&&(C||curChanged)&&!loadJob){
@@ -284,12 +432,15 @@ async function convertLibrary(){
    const playing=!audio.paused,pos=rel();await load(cur,playing,pos);
   }else if(done)prefetch();
   msg(t);
- }finally{btn.disabled=false}
+ }catch(e){
+  if(e&&e.message==='中止'){msg('中止しました');}
+  else throw e;
+ }finally{showWork(false);cancelWork=false}
 }
 
 async function addFiles(files){
  const hadSongs=!!songs.length;
- let n=0,ok=0,conv=0,boost=0;const failed=[];const total=files.length;
+ let n=0,ok=0;const total=files.length;
  for(const f of files){
   n++;
   const label='取り込み中… '+n+'/'+total+'曲 '+f.name;await msgProgress(label);
@@ -297,35 +448,18 @@ async function addFiles(files){
   const types={mp3:'audio/mpeg',m4a:'audio/mp4',aac:'audio/aac',wav:'audio/wav',mp4:'audio/mp4',caf:'audio/x-caf',aif:'audio/aiff',aiff:'audio/aiff',flac:'audio/flac',ogg:'audio/ogg',opus:'audio/ogg'};
   if(!(f.type||'').startsWith('audio/')&&!types[ext]){msg('音楽ファイルではないのでスキップ: '+f.name);continue}
   let buf;try{buf=await f.arrayBuffer()}catch(e){msg('読み込めませんでした（iCloudにあるファイルは先にダウンロードしてください）: '+f.name);continue}
-  let type=(f.type&&f.type.startsWith('audio/'))?f.type:(types[ext]||'audio/mpeg');
-  const u=new Uint8Array(buf),format=!isTargetMp3(u);let extra={};
-  if(isMp3(u))type='audio/mpeg'; // MP3 bytes (also a kept original) play as MP3.
-  let long=false;try{long=(await lengthOf(u,type))>MAX_CONVERT_SEC}catch(e){}
-  if(!format&&long){} // Already the target format; too long to analyze: keep bytes as-is.
-  else{
-   await msgProgress((format?'変換しています… ':'音量を調べています… ')+n+'/'+total+'曲 '+f.name);
-   try{
-    if(long)throw new Error('長すぎる');
-    const r=await processOne(buf,{format,loud:true},(k,p)=>msgProgress(
-     (k==='measure'?'音量を調べています… ':format?'変換しています… ':'音量を上げています… ')+n+'/'+total+'曲 '+f.name+'（'+p+'%）'));
-    extra=loudMeta(r);
-    if(r.buf){buf=r.buf;type='audio/mpeg';if(format)conv++;if(r.gainDb)boost++}
-   }catch(e){console.warn(e);if(format)failed.push(f.name)} // Keep the original playable file.
-  }
+  const type=(f.type&&f.type.startsWith('audio/'))?f.type:(types[ext]||'audio/mpeg');
   const blob=new Blob([buf],{type});
   const id=Date.now().toString(36)+Math.random().toString(36).slice(2,7);
-  const meta=Object.assign({id,title:f.name.replace(/\.[^.]+$/,''),duration:await getDuration(blob),size:blob.size,added:Date.now()},extra);
+  const meta={id,title:f.name.replace(/\.[^.]+$/,''),duration:await getDuration(blob),size:blob.size,added:Date.now()};
   try{await tx('blobs','readwrite',s=>s.put({buf,type},id));await tx('meta','readwrite',s=>s.put(meta));songs.push(meta)}
   catch(e){msg('保存できませんでした: '+f.name+'（'+(e&&e.name||e)+'）');ok=-1;break}
-  buf=null;await yieldUi(true);
-  ok++;
+  buf=null;render();ok++;await yieldUi(true);
  }
- let t='';if(ok>=0){t=ok+'曲を取り込みました';if(conv)t+='（うち'+conv+'曲を44.1kHzステレオのMP3に変換しました）';
-  if(boost)t+='（'+boost+'曲の音量を上げました）';
-  if(failed.length)t+='。変換できなかった曲（元のまま保存）: '+failed.join('、')+'（Apple Musicなど保護された曲は変換できません）';msg(t)}
- render();usage();makeOrder();if(C)rebuild();else prefetch();
+ let t='';if(ok>=0){t=ok+'曲を取り込みました';if(ok)t+=IMPORT_HINT;msg(t)}
+ usage();makeOrder();if(C)rebuild();else prefetch();
  // Keep the import result visible after the first song finishes loading.
- if(!hadSongs&&cur<0&&songs.length){if(await load(0,false)&&t&&(conv||boost||failed.length))msg(t)}
+ if(!hadSongs&&cur<0&&songs.length){if(await load(0,false)&&t)msg(t)}
 }
 async function del(i){
  const s=songs[i];if(!confirm('「'+s.title+'」を削除しますか？'))return;
@@ -649,7 +783,8 @@ $('next').onclick=()=>step(1);
 $('shuffle').onclick=()=>{S.shuffle=!S.shuffle;makeOrder();save();ui();if(C)rebuild();else prefetch()};
 $('repeat').onclick=()=>{S.repeat={none:'all',all:'one',one:'none'}[S.repeat];save();ui();if(C)rebuild();else prefetch()};
 $('dark').onclick=()=>{S.dark=!S.dark;save();ui()};
-$('convert').onclick=()=>convertLibrary();
+$('convert').onclick=()=>{const ctx=audioCtx();if(ctx&&ctx.state==='suspended'){try{ctx.resume()}catch(e){}}convertLibrary()};
+$('cancel').onclick=()=>{cancelWork=true;msg('中止しています…')};
 $('file').onchange=e=>{const f=[...e.target.files];e.target.value='';if(f.length)addFiles(f)};
 // Dragging only previews the time; releasing seeks once (one rebuild, not one per pixel).
 let dragging=false;
@@ -708,7 +843,7 @@ document.addEventListener('visibilitychange',()=>{
 
 window.addEventListener('pagehide',()=>{if(cur>=0&&!loadJob){S.lastPos=rel();save();posState()}});
 
-const APP_VERSION='v17';
+const APP_VERSION='v18';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');

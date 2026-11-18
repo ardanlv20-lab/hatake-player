@@ -41,7 +41,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.route('**/fixture/*',lambda r:r.fulfill(path=str(t/r.request.url.split('/')[-1]),content_type='audio/mpeg'))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v17'
+    assert page.locator('#ver').inner_text()=='v18'
     # Pre-existing library (as if imported earlier), then two m4a imported -> converted by the app.
     page.evaluate("""async (names)=>{for(const [k,n] of names.entries()){const buf=await (await fetch('fixture/'+n)).arrayBuffer();const id='s'+k;
       await tx('blobs','readwrite',st=>st.put({buf,type:'audio/mpeg'},id));const r=parseMp3(new Uint8Array(buf));
@@ -49,6 +49,8 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
       songs.push({id,title:n,duration:r.dur,size:buf.byteLength,added:k,loudChecked:1,gainDb:0})}render();makeOrder()}""",names)
     page.set_input_files('#file',m4a)
     page.wait_for_function(f"songs.length==={N+2} && document.getElementById('msg').textContent.includes('{N+2-N}曲を取り込みました')",timeout=120000)
+    page.click('#convert')
+    page.wait_for_function("!document.getElementById('convert').disabled && document.getElementById('msg').textContent.includes('曲を44.1kHzステレオのMP3にそろえました')",timeout=120000)
     page.evaluate(HELPERS)
     page.evaluate("() => { load(0,false) }")
     s=page.evaluate('state()')
@@ -104,11 +106,11 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     s=page.evaluate('state()');assert s['loop'] and s['count']==N+2 and s['segs']==N+3 and s['first']==14,s
     page.evaluate('actions.pause()')
     assert not errors,errors
-    # Offline: cached v17 shell; skipping works.
+    # Offline: cached v18 shell; skipping works.
     ctx2=browser.new_context();pg=ctx2.new_page();pg.on('pageerror',lambda e:errors.append(str(e)))
     pg.goto(url);pg.wait_for_function('window.__ready');pg.wait_for_function('navigator.serviceWorker.controller!==null',timeout=20000)
     ctx2.set_offline(True);pg.reload();pg.wait_for_function('window.__ready')
-    assert pg.locator('#ver').inner_text()=='v17'
+    assert pg.locator('#ver').inner_text()=='v18'
     small=[]
     for k in (0,1):
         out=t/f'small{k}.mp3';ff('-f','lavfi','-i',f"aevalsrc=0.5*sin(2*PI*{BASE+100*k}*t):s=44100:d=6",'-ac','2','-b:a','128k','-y',str(out));small.append(str(out))
