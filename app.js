@@ -61,7 +61,31 @@ function audioCtx(){
  try{actx=new A({sampleRate:TARGET_SR})}catch(e){try{actx=new A()}catch(e2){actx=null}}
  return actx;
 }
+let DECODE_TIMEOUT_MS=90000,RESAMPLE_TIMEOUT_MS=90000;
+let lastYield=0,lastPaint=0;
 const tick=()=>new Promise(r=>setTimeout(r,0));
+function withTimeout(p,ms,err){
+ let t;
+ return Promise.race([
+  Promise.resolve(p),
+  new Promise((_,rej)=>t=setTimeout(()=>rej(new Error(err||'timeout')),ms))
+ ]).finally(()=>clearTimeout(t));
+}
+// Yield so iPhone Safari can paint progress and stay responsive during long JS loops.
+async function yieldUi(force){
+ const now=performance.now();
+ if(!force&&now-lastYield<24)return;
+ lastYield=now;await tick();
+}
+async function msgProgress(t){
+ $('msg').textContent=t;
+ const now=performance.now();
+ if(now-lastPaint>=250){
+  lastPaint=now;
+  await new Promise(r=>requestAnimationFrame(()=>setTimeout(r,0)));
+ }else await tick();
+ lastYield=performance.now();
+}
 // Bring any decoded buffer to TARGET_SR. Old iOS may refuse a 44.1kHz AudioContext
 // (decodeAudioData then returns the device rate, e.g. 48kHz).
 async function resampleTo(ab,rate){
@@ -72,15 +96,17 @@ async function resampleTo(ab,rate){
   const oc=new O(nch,len,rate),src=oc.createBufferSource();
   // >2 channels are downmixed by Web Audio's speaker rules (keeps center/surround).
   src.buffer=ab;src.connect(oc.destination);src.start(0);
-  const out=await new Promise((res,rej)=>{let p;oc.oncomplete=e=>res(e.renderedBuffer);
+  const render=new Promise((res,rej)=>{let p;oc.oncomplete=e=>res(e.renderedBuffer);
    try{p=oc.startRendering()}catch(e){rej(e);return}if(p&&p.then)p.then(res,rej)});
+  const out=await withTimeout(render,RESAMPLE_TIMEOUT_MS,'44.1kHzへの変換が時間切れになりました');
   if(out&&out.sampleRate===rate&&out.length)return out;
  }catch(e){console.warn(e)}}
  // Fallback: linear interpolation per channel.
  const ratio=ab.sampleRate/rate,chans=[];
  for(let c=0;c<ab.numberOfChannels;c++){const d=ab.getChannelData(c),o=new Float32Array(len);
-  for(let i=0;i<len;i++){const x=i*ratio,k=Math.floor(x),f=x-k,a=d[Math.min(k,d.length-1)],b=d[Math.min(k+1,d.length-1)];o[i]=a+(b-a)*f}
-  chans.push(o);if(c%4===3)await tick()}
+  for(let i=0;i<len;i++){const x=i*ratio,k=Math.floor(x),f=x-k,a=d[Math.min(k,d.length-1)],b=d[Math.min(k+1,d.length-1)];o[i]=a+(b-a)*f;
+   if((i&8191)===8191)await yieldUi()}
+  chans.push(o);await yieldUi(true)}
  return{sampleRate:rate,length:len,numberOfChannels:chans.length,duration:len/rate,getChannelData:c=>chans[c]};
 }
 // ===== 音量をそろえる（小さい曲だけ上げる。再生は1本につなげるので、音量は変換時に書き込む） =====
@@ -107,8 +133,12 @@ async function measureLoudness(L,R,fs,onPct){
   for(let i=o;i<e;i++){const l=L[i],r=R[i],a=l<0?-l:l,b=r<0?-r:r;if(a>peak)peak=a;if(b>peak)peak=b;
    const x=fl(l),y=fr(r);s+=x*x+y*y}
   sub.push(s/step);
-  if(sub.length%200===0){if(onPct)onPct(Math.floor(100*o/len));await tick()}}
- const blocks=[];for(let k=0;k+4<=sub.length;k++)blocks.push((sub[k]+sub[k+1]+sub[k+2]+sub[k+3])/4);
+  if(performance.now()-lastYield>=24||o+step>=len){
+   if(onPct)await onPct(Math.min(100,Math.floor(100*Math.min(o+step,len)/len)));
+   else await yieldUi(true);
+  }
+ }
+ const blocks=[];for(let k=0;k+4<=sub.length;k++){blocks.push((sub[k]+sub[k+1]+sub[k+2]+sub[k+3])/4);if((k&16383)===16383)await yieldUi()}
  if(!blocks.length&&sub.length)blocks.push(sub.reduce((a,b)=>a+b,0)*step/len);
  const lu=e=>-0.691+10*Math.log10(e),mean=a=>a.reduce((x,y)=>x+y,0)/a.length;
  const abs=blocks.filter(e=>e>0&&lu(e)>-70);
@@ -131,25 +161,30 @@ async function limiterEnv(L,R,gain,fs){
  for(let b=0;b<nb;b++){let pk=0;const e=Math.min(len,(b+1)*B);
   for(let i=b*B;i<e;i++){const a=Math.abs(L[i]),c=Math.abs(R[i]);if(a>pk)pk=a;if(c>pk)pk=c}
   const r=pk*gain>ceil?ceil/(pk*gain):1;req[b]=r;if(r<1)any=true;
-  if(b%65536===65535)await tick()}
+  if((b&2047)===2047)await yieldUi()}
  if(!any)return null;
  req[nb]=req[nb-1];
  const env=new Float32Array(nb+1);
  // Neighbour minimum keeps the interpolated gain under each block's requirement.
- for(let b=0;b<=nb;b++)env[b]=Math.min(req[b],b>0?req[b-1]:1,b<nb?req[b+1]:1);
+ for(let b=0;b<=nb;b++){env[b]=Math.min(req[b],b>0?req[b-1]:1,b<nb?req[b+1]:1);if((b&16383)===16383)await yieldUi()}
  const att=1/Math.max(1,Math.round(0.010*fs/B)),rel=1/Math.max(1,Math.round(0.150*fs/B));
- for(let b=nb-1;b>=0;b--)env[b]=Math.min(env[b],env[b+1]+att);
- for(let b=1;b<=nb;b++)env[b]=Math.min(env[b],env[b-1]+rel);
+ for(let b=nb-1;b>=0;b--){env[b]=Math.min(env[b],env[b+1]+att);if((b&16383)===16383)await yieldUi()}
+ for(let b=1;b<=nb;b++){env[b]=Math.min(env[b],env[b-1]+rel);if((b&16383)===16383)await yieldUi()}
  return env;
 }
 // Stereo view of a decoded buffer: mono shares one array; >2ch mixed (even->L, odd->R).
-function stereoPcm(ab){
+async function stereoPcm(ab){
  const nch=ab.numberOfChannels,ch=[];for(let c=0;c<nch;c++)ch.push(ab.getChannelData(c));
  if(nch===1)return{L:ch[0],R:ch[0]};if(nch===2)return{L:ch[0],R:ch[1]};
  const len=ab.length,L=new Float32Array(len),R=new Float32Array(len),nl=Math.ceil(nch/2),nr=Math.floor(nch/2);
- ch.forEach((d,c)=>{const o=c%2?R:L;for(let i=0;i<len;i++)o[i]+=d[i]});
- for(let i=0;i<len;i++){L[i]/=nl;R[i]/=nr}
+ for(let c=0;c<nch;c++){const d=ch[c],o=c%2?R:L;for(let i=0;i<len;i++){o[i]+=d[i];if((i&16383)===16383)await yieldUi()}}
+ for(let i=0;i<len;i++){L[i]/=nl;R[i]/=nr;if((i&16383)===16383)await yieldUi()}
  return{L,R};
+}
+async function decodeRaw(ctx,raw){
+ return withTimeout(new Promise((res,rej)=>{let p;
+  try{p=ctx.decodeAudioData(raw.slice(0),res,e=>rej(e||new Error('decode')))}catch(e){rej(e);return}
+  if(p&&p.then)p.then(res,rej)}),DECODE_TIMEOUT_MS,'音声の読み込みが時間切れになりました');
 }
 // Decode, optionally measure loudness, and encode a 192kbps 44.1kHz stereo MP3 with the
 // boost baked in. format: must re-encode (not target MP3). loud: analyze loudness.
@@ -159,16 +194,14 @@ async function processAudio(raw,{format=true,loud=true}={},onPct){
  const ctx=audioCtx();if(!ctx)throw new Error('この端末では変換できません');
  if(ctx.state==='suspended'){try{await ctx.resume()}catch(e){}}
  // decodeAudioData detaches its input, and old Safari only has the callback form.
- let ab=await new Promise((res,rej)=>{let p;
-  try{p=ctx.decodeAudioData(raw.slice(0),res,e=>rej(e||new Error('decode')))}catch(e){rej(e);return}
-  if(p&&p.then)p.then(res,rej)});
+ let ab=await decodeRaw(ctx,raw);
  if(!ab||!ab.length)throw new Error('音声が空です');
  ab=await resampleTo(ab,TARGET_SR);
  if(ab.sampleRate!==TARGET_SR||!ab.length)throw new Error('44.1kHzにできませんでした');
- let {L,R}=stereoPcm(ab);ab=null;const len=L.length;
+ let {L,R}=await stereoPcm(ab);ab=null;const len=L.length;
  let m={lufs:null,peakDb:null},gainDb=0;
  if(loud){m=await measureLoudness(L,R,TARGET_SR,p=>onPct&&onPct('measure',p));gainDb=boostFor(m)}
- if(!format&&!gainDb)return{buf:null,lufs:m.lufs,peakDb:m.peakDb,gainDb:0};
+ if(!format&&!gainDb){L=R=null;return{buf:null,lufs:m.lufs,peakDb:m.peakDb,gainDb:0}}
  if(!window.lamejs||!lamejs.Mp3Encoder)throw new Error('変換プログラムが読み込まれていません');
  const g=Math.pow(10,gainDb/20),env=gainDb?await limiterEnv(L,R,g,TARGET_SR):null;
  // Always 2 channels: mono is copied to both sides, so the output is never mode 3 (mono).
@@ -179,12 +212,14 @@ async function processAudio(raw,{format=true,loud=true}={},onPct){
   const n=Math.min(BLOCK,len-o);
   for(let i=0;i<n;i++){const k=o+i;let a=g;
    if(env){const b=(k/EB)|0,f=(k-b*EB)/EB;a*=env[b]+(env[b+1]-env[b])*f}
-   OL[i]=s16(L[k]*a);OR[i]=s16(R[k]*a)}
+   OL[i]=s16(L[k]*a);OR[i]=s16(R[k]*a)
+   if((i&8191)===8191)await yieldUi()}
   // Encode in 1152-sample MP3 frames.
   for(let f=0;f<n;f+=1152){const e=Math.min(n,f+1152);
-   const mm=enc.encodeBuffer(OL.subarray(f,e),OR.subarray(f,e));if(mm.length)out.push(new Uint8Array(mm.buffer,mm.byteOffset,mm.length))}
-  if((o/BLOCK)%8===7){if(onPct)onPct('encode',Math.floor(100*o/len));await tick()}
+   const mm=enc.encodeBuffer(OL.subarray(f,e),OR.subarray(f,e));if(mm.length)out.push(new Uint8Array(mm.buffer,mm.byteOffset,mm.length));
+   if(performance.now()-lastYield>=24){if(onPct)await onPct('encode',Math.floor(100*(o+f)/len));else await yieldUi(true)}}
  }
+ if(onPct)await onPct('encode',100);
  const mm=enc.flush();if(mm.length)out.push(new Uint8Array(mm.buffer,mm.byteOffset,mm.length));
  L=R=null; // Drop the decoded PCM early.
  const buf=await new Blob(out,{type:'audio/mpeg'}).arrayBuffer();out.length=0;
@@ -208,19 +243,20 @@ async function convertLibrary(){
     // Already 44.1kHz stereo MP3: re-encode only for a needed boost; fix a wrong stored type.
     if(type!=='audio/mpeg'&&type!=='audio/mp3')await tx('blobs','readwrite',st=>st.put({buf:u.buffer.byteLength===u.length?u.buffer:u.slice().buffer,type:'audio/mpeg'},s.id));
     if(s.loudChecked||s.duration>MAX_CONVERT_SEC)continue; // Long songs are silently left alone.
-    todo.push({id:s.id,format:false});continue}
-   todo.push({id:s.id,format:true});
+    todo.push({id:s.id,format:false});await yieldUi();continue}
+   todo.push({id:s.id,format:true});await yieldUi();
   }
   if(!todo.length){msg('そろえる必要がある曲はありません');return}
   let fmtN=0,boostN=0,n=0;const failed=[];let curChanged=false;
   for(const {id,format} of todo){
    const s=songs.find(x=>x.id===id);if(!s)continue;n++;
-   const label='そろえています… '+n+'/'+todo.length+' '+s.title;msg(label);
+   const label='そろえています… '+n+'/'+todo.length+'曲 '+s.title;await msgProgress(label);
    try{
     const b=await tx('blobs','readonly',st=>st.get(id));if(!b)continue;
     if(s.duration>MAX_CONVERT_SEC)throw new Error('長すぎる');
     const raw=b instanceof Blob?await b.arrayBuffer():b.buf;
-    const r=await processOne(raw,{format,loud:!s.loudChecked},(k,p)=>msg(label+(k==='measure'?'（音量を調べています '+p+'%）':'（'+p+'%）')));
+    const r=await processOne(raw,{format,loud:!s.loudChecked},(k,p)=>msgProgress(
+     (k==='measure'?'音量を調べています… ':'そろえています… ')+n+'/'+todo.length+'曲 '+s.title+'（'+p+'%）'));
     const now=songs.find(x=>x.id===id);if(!now)continue; // Deleted meanwhile.
     const meta=Object.assign({},now,s.loudChecked?{}:loudMeta(r));
     if(r.buf){
@@ -233,6 +269,7 @@ async function convertLibrary(){
     await tx('meta','readwrite',st=>st.put(meta));
     Object.assign(now,meta);
    }catch(e){console.warn(e);failed.push(s.title)}
+   await yieldUi(true);
   }
   const parts=[];
   if(fmtN)parts.push(fmtN+'曲を44.1kHzステレオのMP3にそろえました');
@@ -252,9 +289,10 @@ async function convertLibrary(){
 
 async function addFiles(files){
  const hadSongs=!!songs.length;
- let n=0,ok=0,conv=0,boost=0;const failed=[];
+ let n=0,ok=0,conv=0,boost=0;const failed=[];const total=files.length;
  for(const f of files){
-  const label='取り込み中… '+(++n)+'/'+files.length+' '+f.name;msg(label);
+  n++;
+  const label='取り込み中… '+n+'/'+total+'曲 '+f.name;await msgProgress(label);
   const ext=(f.name.split('.').pop()||'').toLowerCase();
   const types={mp3:'audio/mpeg',m4a:'audio/mp4',aac:'audio/aac',wav:'audio/wav',mp4:'audio/mp4',caf:'audio/x-caf',aif:'audio/aiff',aiff:'audio/aiff',flac:'audio/flac',ogg:'audio/ogg',opus:'audio/ogg'};
   if(!(f.type||'').startsWith('audio/')&&!types[ext]){msg('音楽ファイルではないのでスキップ: '+f.name);continue}
@@ -265,10 +303,11 @@ async function addFiles(files){
   let long=false;try{long=(await lengthOf(u,type))>MAX_CONVERT_SEC}catch(e){}
   if(!format&&long){} // Already the target format; too long to analyze: keep bytes as-is.
   else{
-   msg(label+(format?'（44.1kHzステレオのMP3に変換中）':'（音量を調べています）'));
+   await msgProgress((format?'変換しています… ':'音量を調べています… ')+n+'/'+total+'曲 '+f.name);
    try{
     if(long)throw new Error('長すぎる');
-    const r=await processOne(buf,{format,loud:true},(k,p)=>msg(label+(k==='measure'?'（音量を調べています '+p+'%）':format?'（44.1kHzステレオのMP3に変換中 '+p+'%）':'（音量を上げています '+p+'%）')));
+    const r=await processOne(buf,{format,loud:true},(k,p)=>msgProgress(
+     (k==='measure'?'音量を調べています… ':format?'変換しています… ':'音量を上げています… ')+n+'/'+total+'曲 '+f.name+'（'+p+'%）'));
     extra=loudMeta(r);
     if(r.buf){buf=r.buf;type='audio/mpeg';if(format)conv++;if(r.gainDb)boost++}
    }catch(e){console.warn(e);if(format)failed.push(f.name)} // Keep the original playable file.
@@ -278,6 +317,7 @@ async function addFiles(files){
   const meta=Object.assign({id,title:f.name.replace(/\.[^.]+$/,''),duration:await getDuration(blob),size:blob.size,added:Date.now()},extra);
   try{await tx('blobs','readwrite',s=>s.put({buf,type},id));await tx('meta','readwrite',s=>s.put(meta));songs.push(meta)}
   catch(e){msg('保存できませんでした: '+f.name+'（'+(e&&e.name||e)+'）');ok=-1;break}
+  buf=null;await yieldUi(true);
   ok++;
  }
  let t='';if(ok>=0){t=ok+'曲を取り込みました';if(conv)t+='（うち'+conv+'曲を44.1kHzステレオのMP3に変換しました）';
@@ -668,7 +708,7 @@ document.addEventListener('visibilitychange',()=>{
 
 window.addEventListener('pagehide',()=>{if(cur>=0&&!loadJob){S.lastPos=rel();save();posState()}});
 
-const APP_VERSION='v16';
+const APP_VERSION='v17';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');
