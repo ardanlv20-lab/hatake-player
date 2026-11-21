@@ -21,11 +21,63 @@ function idleScreen(){
  $('seek').max=0;$('seek').value=0;$('cur').textContent=fmt(0);$('dur').textContent=fmt(0);
 }
 
-function openDB(){return new Promise((res,rej)=>{const r=indexedDB.open('hatake-player',1);
- r.onupgradeneeded=()=>{const d=r.result;d.createObjectStore('meta',{keyPath:'id'});d.createObjectStore('blobs')};
- r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
-function tx(store,mode,fn){return new Promise((res,rej)=>{const t=db.transaction(store,mode);const out=fn(t.objectStore(store));
- t.oncomplete=()=>res(out&&out.result!==undefined?out.result:out);t.onerror=()=>rej(t.error);t.onabort=()=>rej(t.error)})}
+let dbOpening=null;
+function bindDB(d){
+ db=d;
+ d.onclose=()=>{if(db===d)db=null};
+ d.onerror=()=>{if(db===d)db=null};
+ d.onversionchange=()=>{if(db===d){db=null;try{d.close()}catch(e){}}};
+}
+function dropDB(d){
+ const x=d||db;if(!x){if(!d)db=null;return}
+ if(db===x)db=null;
+ try{x.onclose=x.onerror=x.onversionchange=null}catch(e){}
+ try{x.close()}catch(e){}
+}
+function openDB(){
+ if(db)return Promise.resolve(db);
+ if(dbOpening)return dbOpening;
+ dbOpening=new Promise((res,rej)=>{
+  let r;try{r=indexedDB.open('hatake-player',1)}catch(e){rej(e);return}
+  r.onupgradeneeded=()=>{const d=r.result;if(!d.objectStoreNames.contains('meta'))d.createObjectStore('meta',{keyPath:'id'});if(!d.objectStoreNames.contains('blobs'))d.createObjectStore('blobs')};
+  r.onsuccess=()=>{bindDB(r.result);res(r.result)};
+  r.onerror=()=>rej(r.error);
+ }).finally(()=>{dbOpening=null});
+ return dbOpening;
+}
+function wakeDB(){if(!db)openDB().catch(()=>{})}
+function isDbGone(e){
+ const n=(e&&e.name)||'',m=(e&&(e.message||''))||'';
+ return n==='InvalidStateError'||n==='TransactionInactiveError'||n==='UnknownError'||n==='AbortError'
+  ||/connection is closing|database connection|Failed to execute ['']transaction['']|InvalidState|TransactionInactive|UnknownError/i.test(n+' '+m);
+}
+function idbErrorMessage(e){
+ const n=(e&&e.name)||'',m=(e&&e.message)||'';
+ if(n==='QuotaExceededError'||/QuotaExceeded/i.test(m))return '保存容量が足りません。不要な曲を消すか、iPhoneの空き容量を増やしてください';
+ return 'データの読み書きに失敗しました。もう一度試してください';
+}
+async function tx(store,mode,fn){
+ let last;
+ for(let attempt=0;attempt<3;attempt++){
+  try{
+   const d=await openDB();
+   return await new Promise((res,rej)=>{
+    let t;try{t=d.transaction(store,mode)}catch(e){rej(e);return}
+    let out;try{out=fn(t.objectStore(store))}catch(e){rej(e);return}
+    t.oncomplete=()=>res(out&&out.result!==undefined?out.result:out);
+    t.onerror=()=>rej(t.error||new Error('transaction error'));
+    t.onabort=()=>rej(t.error||new Error('transaction aborted'));
+   });
+  }catch(e){
+   last=e;
+   if(!isDbGone(e)||attempt===2)throw e;
+   // Already closing/dead (iOS memory pressure, or a superseded load's work). Drop the handle; do not keep using it.
+   dropDB();
+   await new Promise(r=>setTimeout(r,attempt*40));
+  }
+ }
+ throw last;
+}
 
 function getDuration(blob){return new Promise(res=>{const a=new Audio();const u=URL.createObjectURL(blob);
  const done=d=>{revokeUnused(u);res(isFinite(d)?d:0)};
@@ -72,8 +124,11 @@ function playErrorMessage(e){
  const m=(e&&(e.message||e.name))||'';
  if(/時間/.test(m))return '読み込みに時間がかかっています。曲を選び直してください';
  if(/見つかりません|中止/.test(m))return m;
- if(!m||/TypeError|undefined|null is not|Cannot read|AbortError|NotSupported|NotAllowed|The operation|EncodingError|DOMException/i.test(m))
+ if(isDbGone(e))return idbErrorMessage(e);
+ if(!m||/TypeError|undefined|null is not|Cannot read|AbortError|NotSupported|NotAllowed|The operation|EncodingError|DOMException|Failed to execute|IDBDatabase|IndexedDB|InvalidState|UnknownError/i.test(m))
   return '音楽ファイルを読み込めませんでした';
+ // Never show raw English DOMException / browser engine text in #msg.
+ if(/[A-Za-z]{6,}/.test(m)&&!/[ぁ-んァ-ン一-龥]/.test(m))return '音楽ファイルを読み込めませんでした';
  return m;
 }
 const MAX_CONVERT_SEC=30*60; // Decoded PCM of longer files can exhaust iPhone memory.
@@ -460,7 +515,7 @@ async function convertLibrary(){
   msg(t);
  }catch(e){
   if(e&&e.message==='中止'){msg('中止しました');}
-  else throw e;
+  else{console.warn(e);msg(isDbGone(e)?idbErrorMessage(e):'そろえ処理に失敗しました。もう一度試してください')}
  }finally{showWork(false);cancelWork=false}
 }
 
@@ -480,7 +535,7 @@ async function addFiles(files){
   const id=Date.now().toString(36)+Math.random().toString(36).slice(2,7);
   const meta={id,title:f.name.replace(/\.[^.]+$/,''),duration:await getDuration(blob),size:blob.size,added:Date.now()};
   try{await tx('blobs','readwrite',s=>s.put({buf,type},id));await tx('meta','readwrite',s=>s.put(meta));songs.push(meta)}
-  catch(e){msg('保存できませんでした: '+f.name+'（'+(e&&e.name||e)+'）');ok=-1;break}
+  catch(e){console.warn(e);msg('保存できませんでした: '+f.name+'。もう一度試してください');ok=-1;break}
   buf=null;render();ok++;await yieldUi(true);
  }
  let t='';if(ok>=0){t=ok+'曲を取り込みました';if(ok)t+=IMPORT_HINT;msg(t)}
@@ -490,7 +545,9 @@ async function addFiles(files){
 }
 async function del(i){
  const s=songs[i];if(!confirm('「'+s.title+'」を削除しますか？'))return;
- await tx('blobs','readwrite',st=>st.delete(s.id));await tx('meta','readwrite',st=>st.delete(s.id));parseCache.delete(s.id);
+ try{
+  await tx('blobs','readwrite',st=>st.delete(s.id));await tx('meta','readwrite',st=>st.delete(s.id));parseCache.delete(s.id);
+ }catch(e){console.warn(e);msg(isDbGone(e)?idbErrorMessage(e):'削除できませんでした。もう一度試してください');return}
  const wasCur=i===cur;songs.splice(i,1);
  if(wasCur){pausePlayback();audio.removeAttribute('src');try{audio.load()}catch(e){}
   dropC();if(urlNow){revokeUnused(urlNow);urlNow=null}
@@ -571,12 +628,15 @@ async function songFrames(id,b){
 // bitrate, which can land seconds (or a whole song) off in a multi-hour stream.
 // With a native loop and a mid-song start, the skipped head of the first song is appended
 // at the end so the loop continues seamlessly.
-async function buildChunk(i,pos=0){
+async function buildChunk(i,pos=0,gen){
  const k=order.indexOf(i);if(k<0)return null;const parts=[],segs=[],offsets=[];let bytes=0,t=0,sr=0,header=null,version=null,mode=null,count=0,head=null;
+ const stale=()=>gen!=null&&building!==gen;
  for(let j=0;j<order.length;j++){
+  if(stale())return null;
   if((j>0&&S.repeat==='one')||(k+j>=order.length&&S.repeat!=='all'))break;
   const idx=order[(k+j)%order.length],s=songs[idx];
   const b=await tx('blobs','readonly',st=>st.get(s.id));if(!b)break;
+  if(stale())return null;
   const type=b instanceof Blob?b.type:b.type;
   // MIME is only a hint: iOS may label m4a as audio/mpeg. songFrames requires real MP3 bytes.
   if(type&&type!=='audio/mpeg'&&type!=='audio/mp3'&&type!=='audio/x-mpeg'){if(j===0)return null;break}
@@ -589,8 +649,9 @@ async function buildChunk(i,pos=0){
   for(let n=f;n<r.offsets.length;n++)offsets.push(bytes+r.offsets[n]-from);
   parts.push(toBlob(b).slice(r.start+from,r.end));bytes+=r.end-r.start-from;segs.push({i:idx,id:s.id,start:t,dur:r.dur});t+=r.dur;count++;
   if(f>0)head={i:idx,id:s.id,b,r,f,off:-segs[0].start};
+  if(j)await tick();
  }
- if(!segs.length)return null;
+ if(stale()||!segs.length)return null;
  const loop=S.repeat==='one'||(S.repeat==='all'&&count===order.length);
  if(loop&&head){
   const {r,f,off}=head;
@@ -598,11 +659,13 @@ async function buildChunk(i,pos=0){
   parts.push(toBlob(head.b).slice(r.start,r.start+r.offsets[f]));bytes+=r.offsets[f];
   segs.push({i:head.i,id:head.id,start:t,dur:r.dur,head:true});t+=off;
  }
+ if(stale())return null;
  const xf=xingFrame(header,offsets,bytes);if(!xf)return null;
+ if(stale())return null;
  return{url:URL.createObjectURL(new Blob([xf,...parts],{type:'audio/mpeg'})),segs,total:t,count,loop}}
 function findSeg(t){if(!C)return -1;let r=0;for(let n=0;n<C.segs.length;n++)if(t>=C.segs[n].start-0.05)r=n;return r}
 function setSeg(n){if(!C||n<0||!C.segs[n])return;const g=C.segs[n];segIdx=n;cur=songs.findIndex(x=>x.id===g.id);const s=cur>=0?songs[cur]:null;if(!s)return;
- $('title').textContent=s.title;$('seek').max=Math.floor(g.dur)||0;$('dur').textContent=fmt(g.dur);S.lastId=s.id;if(!loadJob)save();render();session(s);posState()}
+ $('title').textContent=s.title;$('seek').max=Math.floor(g.dur)||0;$('dur').textContent=fmt(g.dur);S.lastId=s.id;persistPos(true);render();session(s);posState()}
 function seekAbs(t){if(!audio.getAttribute('src'))return;try{audio.currentTime=t;lastAbs=t}catch(e){}}
 function rel(){return C&&segIdx>=0?audio.currentTime-C.segs[segIdx].start:audio.currentTime}
 function dropC(){if(C){const u=C.url;C=null;segIdx=-1;if(u!==urlNow)revokeUnused(u)}}
@@ -682,9 +745,20 @@ async function load(i,play=false,pos=0){
  if(play){wantPlay=true;userPaused=false}
  stopTicker();audio.pause();clearTimeout(pauseTimer);
  $('title').textContent=songs[i].title;msg('読み込み中…');
+ // Drop the previous joined source before building a new one. A large library
+ // would otherwise keep two full copies in memory, and iOS WebKit then closes
+ // IndexedDB — which is when a foreground tap of another song showed a raw error.
+ const prevUrl=urlNow,prevC=C,ended=audio.onended;
+ audio.onended=null;
+ try{audio.removeAttribute('src');audio.load()}catch(e){}
+ audio.onended=ended;
+ urlNow=null;C=null;segIdx=-1;
+ if(prevC&&prevC.url)revokeUnused(prevC.url);
+ if(prevUrl&&prevUrl!==(prevC&&prevC.url))revokeUnused(prevUrl);
+ dropPre();
  let ch=null;
  try{
-  try{ch=await buildChunk(i,pos)}catch(e){console.warn(e);ch=null}
+  try{ch=await buildChunk(i,pos,my)}catch(e){console.warn(e);ch=null}
   if(loadJob!==job){if(ch)revokeUnused(ch.url);return false}
   const old=urlNow,oc=C;let url;
   if(ch){
@@ -715,7 +789,7 @@ async function load(i,play=false,pos=0){
   if(!ok)throw err||new Error('音楽ファイルを読み込めませんでした');
   loadJob=null;lastAbs=audio.currentTime;
   if(!songs[cur])throw new Error('曲を読み込めませんでした');
-  S.lastId=songs[cur].id;S.lastPos=rel();save();updateProgress();
+  S.lastId=songs[cur].id;S.lastPos=rel();lastSave=Date.now();save();updateProgress();
   msg(ch?'連続再生モード（'+ch.count+'曲をつなげて再生中）':'通常モード（MP3以外の曲は1曲ずつ再生）');
   if(!ch)setTimeout(prefetch,0);
   if(wantPlay&&!initializing){wantPlay=false;startAudio()}
@@ -783,7 +857,7 @@ function playbackSession(){
 function pausePlayback(){
  ++playAttempt;wantPlay=false;userPaused=true;audio.pause();stopTicker();clearTimeout(pauseTimer);
  // Do not clear src or metadata: Control Center must still be able to resume.
- if(!loadJob){S.lastPos=rel();save()}playbackState('paused');
+ if(!loadJob)persistPos(true);playbackState('paused');
 }
 function startAudio(recover=true){
  if(cur<0&&!loadJob){
@@ -845,6 +919,12 @@ let dragging=false;
 $('seek').oninput=e=>{dragging=true;$('cur').textContent=fmt(+e.target.value)};
 $('seek').onchange=e=>{dragging=false;seekSong(+e.target.value)};
 let ticker=null,pauseTimer=null,lastSave=0;
+function persistPos(force){
+ if(cur<0||loadJob)return;
+ const n=Date.now();
+ if(!force&&n-lastSave<5000)return;
+ lastSave=n;S.lastPos=rel();if(songs[cur])S.lastId=songs[cur].id;save();
+}
 function stopTicker(){if(ticker!==null){clearInterval(ticker);ticker=null}}
 function startTicker(){
  if(audio.paused)return;
@@ -853,7 +933,7 @@ function startTicker(){
 }
 function markPaused(){
  $('play').textContent='▶';$('play').setAttribute('aria-label','再生');
- if(!loadJob){S.lastPos=rel();save()}playbackState('paused');
+ if(!loadJob)persistPos(true);playbackState('paused');
 }
 audio.onplay=()=>{
  clearTimeout(pauseTimer);$('play').textContent='⏸';$('play').setAttribute('aria-label','一時停止');
@@ -884,21 +964,25 @@ function updateProgress(){
   if(Number.isFinite(audio.duration)&&audio.duration>0){$('seek').max=Math.floor(audio.duration);$('dur').textContent=fmt(audio.duration)}
  }
  posState(); // Every tick; only persistence is throttled.
- const n=Date.now();if(n-lastSave>3000){lastSave=n;S.lastPos=rel();save()}
+ persistPos(false)
 }
 audio.ontimeupdate=updateProgress;
 document.addEventListener('visibilitychange',()=>{
+ if(!document.hidden)wakeDB();
  if(loadJob||initializing)return;
- if(document.hidden){if(cur>=0){S.lastPos=rel();save()}return}
+ if(document.hidden){persistPos(true);return}
  if(cur<0||userPaused)return;
  const wrap=C&&C.loop&&lastAbs>C.total-3;
  if(audio.currentTime<1&&lastAbs>5&&!wrap)seekAbs(lastAbs);
  if(audio.paused)startAudio();else startTicker();
 });
 
-window.addEventListener('pagehide',()=>{if(cur>=0&&!loadJob){S.lastPos=rel();save();posState()}});
+window.addEventListener('pagehide',()=>{persistPos(true);posState()});
+window.addEventListener('pageshow',wakeDB);
+window.addEventListener('focus',wakeDB);
 
-const APP_VERSION='v19';
+
+const APP_VERSION='v20';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');
@@ -907,11 +991,14 @@ $('update').onclick=async()=>{
  location.replace(location.pathname+'?u='+Date.now());
 };
 (async()=>{
- ui();$('ver').textContent=APP_VERSION;msg('読み込み中…');db=await openDB();
- songs=(await tx('meta','readonly',s=>s.getAll())).sort((a,b)=>a.added-b.added);
- makeOrder();render();usage();
- if(navigator.storage&&navigator.storage.persist)navigator.storage.persist().then(p=>{window.__persisted=p});
- idleScreen();msg('');
+ ui();$('ver').textContent=APP_VERSION;msg('読み込み中…');
+ try{
+  await openDB();
+  songs=(await tx('meta','readonly',s=>s.getAll())).sort((a,b)=>a.added-b.added);
+  makeOrder();render();usage();
+  if(navigator.storage&&navigator.storage.persist)navigator.storage.persist().then(p=>{window.__persisted=p});
+  idleScreen();msg('');
+ }catch(e){console.warn(e);idleScreen();msg('曲の一覧を読み込めませんでした。アプリを開き直してください')}
  initializing=false;
  if(wantPlay){wantPlay=false;userPaused=true;if(songs.length)msg('曲を選んでください')}
  if('serviceWorker' in navigator){
