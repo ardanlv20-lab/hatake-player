@@ -122,7 +122,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     browser=p.chromium.launch(args=['--autoplay-policy=no-user-gesture-required'])
     page=browser.new_context(service_workers='block').new_page()
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v24'
+    assert page.locator('#ver').inner_text()=='v25'
 
     page.evaluate("""async (rows)=>{
       S.shuffle=false;S.repeat='none';save();ui();

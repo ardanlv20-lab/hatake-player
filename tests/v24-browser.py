@@ -62,7 +62,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     browser=p.chromium.launch(args=['--autoplay-policy=no-user-gesture-required'])
     page=browser.new_context(service_workers='block').new_page()
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v24'
+    assert page.locator('#ver').inner_text()=='v25'
     assert page.locator('#reset').inner_text()=='リセット'
 
     rows=[[f'id{i}',f'song-{i}',3,list(b)] for i,b in enumerate(blobs)]

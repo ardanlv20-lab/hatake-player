@@ -56,7 +56,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.route('**/fixture/*',lambda r:r.fulfill(path=str(t/r.request.url.split('/')[-1]),content_type='audio/mpeg'))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v24'
+    assert page.locator('#ver').inner_text()=='v25'
     # Pre-existing library (as if imported earlier), then two m4a imported -> converted by the app.
     page.evaluate("""async (names)=>{for(const [k,n] of names.entries()){const buf=await (await fetch('fixture/'+n)).arrayBuffer();const id='s'+k;
       await tx('blobs','readwrite',st=>st.put({buf,type:'audio/mpeg'},id));const r=parseMp3(new Uint8Array(buf));
@@ -70,8 +70,11 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.evaluate("() => { load(0,false) }")
     s=page.evaluate('state()')
     assert s['first']==0 and s['paused'] and s['mode']=='single',s
+    # Mixed CBR/VBR must not be packed into one timeline (iOS currentTime would drift).
     n=page.evaluate("async ()=>{const ch=await buildChunk(0,0);const n=ch&&ch.count;if(ch&&ch.url)revokeUnused(ch.url);return n||0}")
-    assert n==N+2,('library should still be joinable after the current song',n)
+    assert n==0,('song 0 is 320k CBR followed by VBR, so it must not join',n)
+    n=page.evaluate("async ()=>{const ch=await buildChunk(14,0);const n=ch&&ch.count;if(ch&&ch.url)revokeUnused(ch.url);return n||0}")
+    assert n==2,('the two converted 192k CBR songs should still join',n)
     def check(s,k,pos,tol=0.15,label=''):
         exp=freq(k,pos)
         assert s['cur']==k and s['first']==k,(label,'wrong song',s,k)
@@ -124,21 +127,22 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     check(s,14,40,0.6,'repeat-one seek');assert s['loop'] and s['mode']=='single',s
     page.evaluate('seekAbs(Math.max(0,(audio.duration||0)-0.6))')
     page.wait_for_function('audio.currentTime<1 && audio.currentTime>0.05 && !audio.paused && cur===14',timeout=10000)
-    # Repeat all: when the current file ends, the following songs join (including a wrap).
+    # Repeat all: when the current file ends, the next song plays (join if the
+    # following tracks share the same CBR bitrate; otherwise the original file).
     page.click('#repeat')   # one -> none
     page.click('#repeat')   # none -> all
     page.evaluate('seekSong(Math.max(0,(audio.duration||songs[cur].duration)-1))')
     page.evaluate('startAudio()')
-    page.wait_for_function('C && C.loop && cur!==14 && !loadJob && mediaReady',timeout=15000)
+    page.wait_for_function('cur!==14 && !loadJob && mediaReady && !audio.paused',timeout=15000)
     s=page.evaluate('state()')
-    assert s['mode']=='join' and s['loop'] and s['count']>=2 and s['first']!=14,s
+    assert s['cur']==15 and abs(s['f']-freq(15,0))<2.5,s
     page.evaluate('actions.pause()')
     assert not errors,errors
     # Offline: cached shell; skipping works.
     ctx2=browser.new_context();pg=ctx2.new_page();pg.on('pageerror',lambda e:errors.append(str(e)))
     pg.goto(url);pg.wait_for_function('window.__ready');pg.wait_for_function('navigator.serviceWorker.controller!==null',timeout=20000)
     ctx2.set_offline(True);pg.reload();pg.wait_for_function('window.__ready')
-    assert pg.locator('#ver').inner_text()=='v24'
+    assert pg.locator('#ver').inner_text()=='v25'
     small=[]
     for k in (0,1):
         out=t/f'small{k}.mp3';ff('-f','lavfi','-i',f"aevalsrc=0.5*sin(2*PI*{BASE+100*k}*t):s=44100:d=6",'-ac','2','-b:a','128k','-y',str(out));small.append(str(out))
@@ -147,6 +151,6 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     assert s['cur']==1 and s['first']==1 and abs(s['f']-(BASE+100))<2.5,s
     ctx2.close()
     assert not errors,errors
-    print('PASS v16: next/prev buttons, lock-screen next/prev, seek bar, rewind/forward 10s, seekto all land on the target song frame (decoded chunk start + audible tone), rapid double-next, prev restart, auto-advance keeps one src, repeat-one/all seamless head wrap, converted m4a, offline')
+    print('PASS v16: next/prev buttons, lock-screen next/prev, seek bar, rewind/forward 10s, seekto all land on the target song frame (decoded chunk start + audible tone), rapid double-next, prev restart, same-CBR auto-advance keeps one src, repeat-one loops the original file, repeat-all advances to the next song, converted m4a, offline')
     browser.close()
 server.shutdown()

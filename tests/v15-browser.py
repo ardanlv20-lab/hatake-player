@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v24'
+    assert page.locator('#ver').inner_text()=='v25'
     assert page.locator('#convert').inner_text()=='形式と音量をそろえる'
     assert page.evaluate("getComputedStyle(document.getElementById('convert')).minHeight")=='64px'
     # Import path: store as-is (no loudness yet). Already-target MP3s still join. Then the button boosts.
@@ -117,7 +117,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     ctx2=browser.new_context();pg=ctx2.new_page();pg.on('pageerror',lambda e:errors.append(str(e)))
     pg.goto(url);pg.wait_for_function('window.__ready');pg.wait_for_function('navigator.serviceWorker.controller!==null',timeout=20000)
     ctx2.set_offline(True);pg.reload();pg.wait_for_function('window.__ready')
-    assert pg.locator('#ver').inner_text()=='v24'
+    assert pg.locator('#ver').inner_text()=='v25'
     pg.set_input_files('#file',[quiet,loud])
     pg.wait_for_function("songs.length===2 && cur===0 && !loadJob && audio.readyState>=1",timeout=60000)
     n=pg.evaluate("async ()=>{const ch=await buildChunk(0,0);const n=ch&&ch.count;if(ch&&ch.url)revokeUnused(ch.url);return n||0}")

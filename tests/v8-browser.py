@@ -14,7 +14,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
             path=str(pathlib.Path(tmp)/f'{rate}-{channels}-{n}.mp3')
             subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-f','lavfi','-i',
                             f'sine=frequency={440+100*n}:duration=4','-ar',str(rate),'-ac',str(channels),
-                            '-q:a',str(2+n),'-y',path],check=True)
+                            '-b:a','128k','-y',path],check=True)
             files.append(path)
         context=browser.new_context()
         context.add_init_script("""

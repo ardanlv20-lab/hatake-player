@@ -31,7 +31,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.on('console',lambda m: (m.type=='error') and errors.append('console:'+m.text))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v24'
+    assert page.locator('#ver').inner_text()=='v25'
 
     # The exact user-facing English string must never be returned by playErrorMessage.
     hidden=page.evaluate("""(s)=>{
