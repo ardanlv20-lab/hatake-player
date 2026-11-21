@@ -57,6 +57,7 @@ function idbErrorMessage(e){
  return 'データの読み書きに失敗しました。もう一度試してください';
 }
 async function tx(store,mode,fn){
+ if(window.__txDelay)await new Promise(r=>setTimeout(r,window.__txDelay));
  let last;
  for(let attempt=0;attempt<3;attempt++){
   try{
@@ -575,7 +576,7 @@ function makeOrder(){pendingOrder=null;order=songs.map((_,i)=>i);if(S.shuffle)fo
 // Blob slices keep the joined audio out of JS memory (only one song is parsed at
 // a time). Xing's byte counter is 32-bit; reserve room for its metadata frame.
 const CAP=0xFFFFFFFF-4096;
-let C=null,segIdx=-1,lastAbs=0,userPaused=true,building=0,pendingOrder=null,freshStart=0,freshGuard=0;
+let C=null,segIdx=-1,lastAbs=0,userPaused=true,building=0,pendingOrder=null,freshStart=0,freshGuard=0,mediaReady=false;
 const BR1=[0,32,40,48,56,64,80,96,112,128,160,192,224,256,320],BR2=[0,8,16,24,32,40,48,56,64,80,96,112,128,144,160],SR=[44100,48000,32000];
 function hdr(u,p){if(u[p]!==0xFF||(u[p+1]&0xE0)!==0xE0)return null;const v=(u[p+1]>>3)&3,l=(u[p+1]>>1)&3;if(v===1||l!==1)return null;
  const bi=u[p+2]>>4,si=(u[p+2]>>2)&3;if(bi===0||bi===15||si===3)return null;const v1=v===3;
@@ -664,13 +665,27 @@ async function buildChunk(i,pos=0,gen){
  if(stale())return null;
  const blob=new Blob([xf,...parts],{type:'audio/mpeg'});
  return{url:URL.createObjectURL(blob),blob,segs,total:t,count,loop}}
+function mediaLive(){
+ // Ignore events from a src we just tore down, or from a load that has not been verified yet.
+ return mediaReady&&!loadJob&&!initializing&&urlNow&&(audio.src===urlNow||audio.currentSrc===urlNow);
+}
 function findSeg(t){if(!C)return -1;let r=0;for(let n=0;n<C.segs.length;n++)if(t>=C.segs[n].start-0.05)r=n;return r}
-function setSeg(n){if(!C||n<0||!C.segs[n])return;const g=C.segs[n];segIdx=n;cur=songs.findIndex(x=>x.id===g.id);const s=cur>=0?songs[cur]:null;if(!s)return;
+function setSeg(n){
+ if(!C||n<0||!C.segs[n])return;
+ if(C.gen!=null&&C.gen!==building)return;
+ if(!loadJob&&!mediaReady)return;
+ const g=C.segs[n];segIdx=n;cur=songs.findIndex(x=>x.id===g.id);const s=cur>=0?songs[cur]:null;if(!s)return;
  $('title').textContent=s.title;$('seek').max=Math.floor(g.dur)||0;$('dur').textContent=fmt(g.dur);S.lastId=s.id;persistPos(true);render();session(s);posState()}
 function seekAbs(t){freshStart=0;if(!audio.getAttribute('src'))return;try{audio.currentTime=t;lastAbs=t}catch(e){}}
 function rel(){return C&&segIdx>=0?audio.currentTime-C.segs[segIdx].start:audio.currentTime}
 function dropC(){if(C){const u=C.url;C=null;segIdx=-1;if(u!==urlNow)revokeUnused(u)}}
-async function rebuild(){if(!C||cur<0)return;const r=rel(),pl=!audio.paused;await load(cur,pl,r)}
+async function rebuild(){
+ // C is cleared at the start of load(); still rebuild the in-flight or current song
+ // so a second tap on shuffle/repeat (or a queued rebuild) is not dropped.
+ const i=curIdx();if(i<0)return;
+ const r=loadJob?loadJob.pos:(C?rel():0);
+ await load(i,playingNow(),r);
+}
 let pre=null;
 const toBlob=blob=>blob instanceof Blob?blob:new Blob([blob.buf],{type:blob.type});
 function nextIdx(){
@@ -726,9 +741,8 @@ function restorePosition(position,job=loadJob,url=audio.src){
  });
 }
 function resetMedia(){
- const ended=audio.onended;audio.onended=null;
+ mediaReady=false;
  try{audio.removeAttribute('src');audio.load()}catch(e){}
- audio.onended=ended;
 }
 // Attach a chunk that already starts at the play head. Never seek inside the long
 // joined stream: on iOS, currentTime= can land a whole song off via the Xing TOC,
@@ -790,6 +804,8 @@ async function load(i,play=false,pos=0){
  const previous=loadJob,my=++building;
  if(previous&&previous.cancel)previous.cancel();
  const job=loadJob={generation:my,id:songs[i].id,pos:Math.max(0,pos||0),cancel:null};
+ mediaReady=false;freshStart=0;++playAttempt;
+ cur=i;
  if(pendingOrder&&pendingOrder[0]===i){order=pendingOrder;pendingOrder=null}
  if(play){wantPlay=true;userPaused=false}
  stopTicker();audio.pause();clearTimeout(pauseTimer);
@@ -798,10 +814,8 @@ async function load(i,play=false,pos=0){
  // Drop the previous joined source before building a new one. A large library
  // would otherwise keep two full copies in memory, and iOS WebKit then closes
  // IndexedDB — which is when a foreground tap of another song showed a raw error.
- const prevUrl=urlNow,prevC=C,ended=audio.onended;
- audio.onended=null;
- try{audio.removeAttribute('src');audio.load()}catch(e){}
- audio.onended=ended;
+ const prevUrl=urlNow,prevC=C;
+ resetMedia();
  urlNow=null;C=null;segIdx=-1;
  if(prevC&&prevC.url)revokeUnused(prevC.url);
  if(prevUrl&&prevUrl!==(prevC&&prevC.url))revokeUnused(prevUrl);
@@ -812,7 +826,7 @@ async function load(i,play=false,pos=0){
   if(loadJob!==job){if(ch)revokeUnused(ch.url);return false}
   let url,ok=false,err=null;
   if(ch){
-   dropPre();C=ch;url=ch.url;urlNow=url;setSeg(0);ui();
+   dropPre();ch.gen=my;C=ch;url=ch.url;urlNow=url;ui();
    try{
     const att=await attachChunk(ch,job);
     url=att.url;urlNow=url;if(C)C.url=url;
@@ -846,11 +860,13 @@ async function load(i,play=false,pos=0){
   }
   if(loadJob!==job)return false;
   if(!ok)throw err||new Error('音楽ファイルを読み込めませんでした');
-  loadJob=null;lastAbs=audio.currentTime||0;freshStart=ch?performance.now():0;
+  if(ch){ch.gen=my;C=ch;setSeg(0)}
   if(!songs[cur]||songs[cur].id!==job.id)throw new Error('曲を読み込めませんでした');
+  lastAbs=audio.currentTime||0;freshStart=ch?performance.now():0;
+  mediaReady=true;loadJob=null;
   S.lastId=songs[cur].id;S.lastPos=rel();lastSave=Date.now();save();updateProgress();
   msg(ch?'連続再生モード（'+ch.count+'曲をつなげて再生中）':'通常モード（MP3以外の曲は1曲ずつ再生）');
-  if(!ch)setTimeout(prefetch,0);
+  if(!ch){const g=building;setTimeout(()=>{if(g===building&&!loadJob)prefetch()},0)}
   if(wantPlay&&!initializing){wantPlay=false;startAudio()}
   return true;
  }catch(e){
@@ -884,6 +900,7 @@ function seekSong(t){
  seekAbs(t);posState();
 }
 function onEnded(){
+ if(!mediaLive())return;
  if(C){if(S.repeat==='one'){load(cur,true,0);return} // Normally the native loop handles this.
   const last=C.segs[C.segs.length-1].i,k=order.indexOf(last)+1;
   if(k<order.length){load(order[k],true);return}if(S.repeat==='all'&&order.length){load(order[0],true);return}userPaused=true;return}
@@ -952,13 +969,13 @@ function startAudio(recover=true){
   if(attempt!==playAttempt||generation!==building||source!==audio.src||loadJob||userPaused)return;
   if(songs[cur])session(songs[cur]);playbackState('playing');startTicker();
  }).catch(async e=>{
-  if(attempt!==playAttempt||userPaused||source!==audio.src||generation!==building)return;
+  if(attempt!==playAttempt||userPaused||source!==audio.src||generation!==building||loadJob)return;
   playbackState('paused');
   if(!recover||!songs[i]){msg('再生できませんでした。アプリを開いて再生ボタンを押してください。');return}
   // Only a failed direct resume may rebuild a discarded/invalid media resource.
   try{
    const restored=await load(i,false,Math.max(0,position||0));
-   if(!restored||attempt!==playAttempt||userPaused||!audio.paused)return;
+   if(!restored||attempt!==playAttempt||generation!==building||userPaused||!audio.paused)return;
    await startAudio(false);
   }catch(error){msg('曲を読み直せませんでした。アプリで曲を選び直してください。')}
  });
@@ -976,8 +993,8 @@ function ui(){
 $('play').onclick=()=>{if(loadJob||initializing){if(wantPlay)pausePlayback();else startAudio();return}if(audio.paused)startAudio();else pausePlayback()};
 $('prev').onclick=()=>{if(curIdx()>=0&&curPos()>3)seekSong(0);else step(-1)};
 $('next').onclick=()=>step(1);
-$('shuffle').onclick=()=>{S.shuffle=!S.shuffle;makeOrder();save();ui();if(C)rebuild();else prefetch()};
-$('repeat').onclick=()=>{S.repeat={none:'all',all:'one',one:'none'}[S.repeat];save();ui();if(C)rebuild();else prefetch()};
+$('shuffle').onclick=()=>{S.shuffle=!S.shuffle;makeOrder();save();ui();if(C||loadJob)rebuild();else prefetch()};
+$('repeat').onclick=()=>{S.repeat={none:'all',all:'one',one:'none'}[S.repeat];save();ui();if(C||loadJob)rebuild();else prefetch()};
 $('dark').onclick=()=>{S.dark=!S.dark;save();ui()};
 $('convert').onclick=()=>{const ctx=audioCtx();if(ctx&&ctx.state==='suspended'){try{ctx.resume()}catch(e){}}convertLibrary()};
 $('cancel').onclick=()=>{cancelWork=true;msg('中止しています…')};
@@ -1004,22 +1021,26 @@ function markPaused(){
  if(!loadJob)persistPos(true);playbackState('paused');
 }
 audio.onplay=()=>{
+ if(!mediaLive())return;
  clearTimeout(pauseTimer);$('play').textContent='⏸';$('play').setAttribute('aria-label','一時停止');
  playbackState('playing');startTicker();
 };
 audio.onpause=()=>{
  stopTicker();clearTimeout(pauseTimer);
+ if(!mediaLive())return;
  if(userPaused){markPaused();return}
  // iOS can emit pause during seeks / buffering / audio-route changes.
- pauseTimer=setTimeout(()=>{if(audio.paused)markPaused();else startTicker()},300);
+ const g=building;
+ pauseTimer=setTimeout(()=>{if(g!==building||!mediaLive())return;if(audio.paused)markPaused();else startTicker()},300);
 };
-audio.onended=()=>{stopTicker();clearTimeout(pauseTimer);onEnded();if(audio.paused)playbackState('paused')};
-audio.addEventListener('loadedmetadata',()=>{updateProgress();posState()});
-audio.addEventListener('durationchange',posState);audio.addEventListener('ratechange',posState);
-audio.addEventListener('playing',()=>{clearTimeout(pauseTimer);playbackState('playing');startTicker()});
-audio.addEventListener('seeked',()=>{updateProgress();if(!audio.paused)startTicker()});
+audio.onended=()=>{if(!mediaLive())return;stopTicker();clearTimeout(pauseTimer);onEnded();if(audio.paused)playbackState('paused')};
+audio.addEventListener('loadedmetadata',()=>{if(!mediaLive())return;updateProgress();posState()});
+audio.addEventListener('durationchange',()=>{if(mediaLive())posState()});
+audio.addEventListener('ratechange',()=>{if(mediaLive())posState()});
+audio.addEventListener('playing',()=>{if(!mediaLive())return;clearTimeout(pauseTimer);playbackState('playing');startTicker()});
+audio.addEventListener('seeked',()=>{if(!mediaLive())return;updateProgress();if(!audio.paused)startTicker()});
 function updateProgress(){
- if(loadJob)return;
+ if(!mediaLive())return;
  let t=audio.currentTime;if(!Number.isFinite(t)||t<0)return;
  if(C&&freshStart){
   const elapsed=(performance.now()-freshStart)/1000;
@@ -1060,7 +1081,7 @@ window.addEventListener('pageshow',wakeDB);
 window.addEventListener('focus',wakeDB);
 
 
-const APP_VERSION='v21';
+const APP_VERSION='v22';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');
