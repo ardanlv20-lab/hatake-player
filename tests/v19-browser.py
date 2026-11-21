@@ -34,7 +34,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v22'
+    assert page.locator('#ver').inner_text()=='v23'
 
     # iOS-like library: m4a and wav stored as audio/mpeg (picker often lies); mixed rates/channels.
     items=[

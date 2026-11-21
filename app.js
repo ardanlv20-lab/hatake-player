@@ -93,8 +93,8 @@ function isMp3(u){
  // even if random bytes inside look like MP3 frame headers.
  if(/^(RIFF|fLaC|OggS|FORM|caff)/.test(tag)||tag.slice(4,8)==='ftyp')return false;
  const r=parseMp3(u);if(!r||r.offsets.length<2)return false;
- let p=0;while(u.length-p>10&&u[p]===0x49&&u[p+1]===0x44&&u[p+2]===0x33)p+=10+(((u[p+6]&127)<<21)|((u[p+7]&127)<<14)|((u[p+8]&127)<<7)|(u[p+9]&127))+((u[p+5]&0x10)?10:0);
- return (r.end-r.start)>=0.5*(u.length-p);
+ const p=skipId3(u,0),end=stripTail(u,u.length);
+ return (r.end-r.start)>=0.5*(end-p);
 }
 // Target format for the whole library: MPEG-1 Layer III, 44100 Hz, 2 channels.
 const TARGET_SR=44100;
@@ -557,11 +557,17 @@ async function del(i){
  else if(i<cur)cur--;
  makeOrder();render();usage();dropPre();if(C&&!wasCur)rebuild();else prefetch();
 }
+function loadById(id,play=false,pos=0){
+ const i=songs.findIndex(x=>x.id===id);
+ if(i<0){msg('曲が見つかりません');return Promise.resolve(false)}
+ return load(i,play,pos);
+}
+function delById(id){const i=songs.findIndex(x=>x.id===id);if(i>=0)return del(i)}
 function render(){
  const ul=$('list');ul.innerHTML='';
  songs.forEach((s,i)=>{const li=document.createElement('li');if(i===cur)li.className='cur';
-  const t=document.createElement('div');t.className='t';t.textContent=(i===cur?'▶ ':'')+s.title+'（'+fmt(s.duration)+'）';t.onclick=()=>load(i,true);
-  const b=document.createElement('button');b.textContent='🗑';b.setAttribute('aria-label','削除');b.onclick=()=>del(i);
+  const t=document.createElement('div');t.className='t';t.textContent=(i===cur?'▶ ':'')+s.title+'（'+fmt(s.duration)+'）';t.onclick=()=>loadById(s.id,true);
+  const b=document.createElement('button');b.textContent='🗑';b.setAttribute('aria-label','削除');b.onclick=()=>delById(s.id);
   li.append(t,b);ul.append(li)});
 }
 async function usage(){
@@ -582,16 +588,100 @@ function hdr(u,p){if(u[p]!==0xFF||(u[p+1]&0xE0)!==0xE0)return null;const v=(u[p+
  const bi=u[p+2]>>4,si=(u[p+2]>>2)&3;if(bi===0||bi===15||si===3)return null;const v1=v===3;
  const sr=SR[si]/(v1?1:v===2?2:4),br=(v1?BR1:BR2)[bi]*1000,pad=(u[p+2]>>1)&1;
  return{len:Math.floor((v1?144:72)*br/sr)+pad,sr,smp:v1?1152:576,v,mode:u[p+3]>>6}}
-function parseMp3(u){let p=0,end=u.length;
- while(end-p>10&&u[p]===0x49&&u[p+1]===0x44&&u[p+2]===0x33){p+=10+(((u[p+6]&127)<<21)|((u[p+7]&127)<<14)|((u[p+8]&127)<<7)|(u[p+9]&127))+((u[p+5]&0x10)?10:0)}
- if(end-p>128&&u[end-128]===0x54&&u[end-127]===0x41&&u[end-126]===0x47)end-=128;
- let h=null,lim=Math.min(end-4,p+65536);while(p<lim&&!(h=hdr(u,p)))p++;if(!h)return null;
- const sr=h.sr;let start=p,samples=0,first=true,q=p,miss=0,header=null;const offsets=[];
- while(q+4<=end){const f=hdr(u,q);if(!f||q+f.len>end){if(++miss>4096)break;q++;continue}
-  if(first){first=false;const w=String.fromCharCode(...u.subarray(q+4,Math.min(q+f.len,q+60)));if(/Xing|Info|VBRI/.test(w)){q+=f.len;start=q;continue}}
-  if(f.sr!==sr||f.v!==h.v||(f.mode===3)!==(h.mode===3))return null;
-  if(!header)header=u.slice(q,q+4);offsets.push(q-start);samples+=f.smp;q+=f.len;p=q}
- if(!samples)return null;return{start,end:p,dur:samples/sr,sr,header,offsets,v:h.v,mode:header[3]>>6,smp:h.smp}}
+function synchsafe(u,o){return ((u[o]&127)<<21)|((u[o+1]&127)<<14)|((u[o+2]&127)<<7)|(u[o+3]&127)}
+function skipId3(u,p){
+ p=p||0;
+ while(p+10<=u.length&&u[p]===0x49&&u[p+1]===0x44&&u[p+2]===0x33){
+  const n=10+synchsafe(u,p+6)+((u[p+5]&0x10)?10:0);
+  if(n<10||p+n>u.length)break;
+  p+=n;
+ }
+ return p;
+}
+function stripTail(u,end){
+ end=end||u.length;
+ for(;;){
+  if(end>=128&&u[end-128]===0x54&&u[end-127]===0x41&&u[end-126]===0x47){end-=128;continue}
+  if(end>=32&&u[end-32]===0x41&&u[end-31]===0x50&&u[end-30]===0x45&&u[end-29]===0x54&&
+     u[end-28]===0x41&&u[end-27]===0x47&&u[end-26]===0x45&&u[end-25]===0x58){
+   const size=u[end-20]|(u[end-19]<<8)|(u[end-18]<<16)|(u[end-17]<<24);
+   const flags=u[end-12]|(u[end-11]<<8)|(u[end-10]<<16)|(u[end-9]<<24);
+   let n=size;if(flags&0x20000000)n+=32;
+   if(n>=32&&n<=end){end-=n;continue}
+   break;
+  }
+  if(end>=15){
+   const tag=String.fromCharCode(u[end-9],u[end-8],u[end-7],u[end-6],u[end-5],u[end-4],u[end-3],u[end-2],u[end-1]);
+   if(tag==='LYRICS200'){
+    const num=String.fromCharCode(u[end-15],u[end-14],u[end-13],u[end-12],u[end-11],u[end-10]);
+    const sz=parseInt(num,10);
+    if(sz>0&&end>=15+sz){end-=15+sz;continue}
+   }
+  }
+  break;
+ }
+ return end;
+}
+function sameFmt(a,b){return a&&b&&a.sr===b.sr&&a.v===b.v&&(a.mode===3)===(b.mode===3)}
+function tripleAt(u,q,end){
+ const a=hdr(u,q);if(!a||q+a.len>end)return null;
+ const b=hdr(u,q+a.len);if(!sameFmt(a,b)||q+a.len+b.len>end)return null;
+ const c=hdr(u,q+a.len+b.len);if(!sameFmt(a,c)||q+a.len+b.len+c.len>end)return null;
+ return a;
+}
+function isXingAt(u,q,end){
+ const h=hdr(u,q);if(!h||q+h.len>end)return false;
+ const at=q+4+(h.v===3?(h.mode===3?17:32):(h.mode===3?9:17));
+ if(at+4<=end){
+  const tag=String.fromCharCode(u[at],u[at+1],u[at+2],u[at+3]);
+  if(/^(Xing|Info|VBRI)$/.test(tag))return true;
+ }
+ if(q+40<=end&&String.fromCharCode(u[q+36],u[q+37],u[q+38],u[q+39])==='VBRI')return true;
+ return false;
+}
+function walkFrames(u,q,end,skipXing){
+ let first=!!skipXing,samples=0,header=null,start=q,last=q;
+ const offsets=[];
+ const h0=hdr(u,q);if(!h0||q+h0.len>end)return null;
+ const sr=h0.sr,v=h0.v,mono=h0.mode===3;
+ while(q+4<=end){
+  const f=hdr(u,q);
+  if(!f||q+f.len>end||f.sr!==sr||f.v!==v||(f.mode===3)!==mono)break;
+  if(first){first=false;if(isXingAt(u,q,end)){q+=f.len;start=q;last=q;continue}}
+  if(!header)header=u.slice(q,q+4);
+  offsets.push(q-start);samples+=f.smp;last=q+f.len;q+=f.len;
+ }
+ if(!samples||offsets.length<3||!header)return null;
+ const audio=hdr(header,0);
+ return{start,end:last,dur:samples/sr,sr,header,offsets,v:(header[1]>>3)&3,mode:header[3]>>6,smp:audio?audio.smp:h0.smp};
+}
+function parseMp3(u){
+ // Skip every leading ID3v2 tag by its declared size (and the optional v2.4 footer),
+ // strip trailing ID3v1 / APEv2 / Lyrics3, then prefer a real Xing/Info/VBRI origin.
+ // Sync requires 3 consecutive frames so mid-tag 0xFFFB-like bytes are not treated as audio.
+ let base=skipId3(u,0);
+ const end=stripTail(u,u.length);
+ while(base<end&&u[base]===0)base++;
+ if(end-base<16)return null;
+ const lim=Math.min(end-4,base+2097152);
+ let best=null;
+ const consider=r=>{if(r&&(!best||r.dur>best.dur))best=r};
+ for(let p=base;p<lim;p++){
+  if(!isXingAt(u,p,end))continue;
+  const h=hdr(u,p);if(!h)continue;
+  const after=p+h.len;
+  if(!tripleAt(u,after,end))continue;
+  consider(walkFrames(u,after,end,false));
+ }
+ if(best&&best.offsets.length>=3)return best;
+ best=null;
+ for(let p=base;p<lim;p++){
+  if(!tripleAt(u,p,end))continue;
+  consider(walkFrames(u,p,end,true));
+  if(best&&best.dur>=1)break;
+ }
+ return best;
+}
 // One Xing frame describes the whole joined stream, not each original file.
 // Counts exclude this metadata frame; byte count and TOC include its bytes.
 function xingFrame(header,offsets,bytes){
@@ -613,12 +703,24 @@ function xingFrame(header,offsets,bytes){
 // Parsed frame tables per song (bytes never change for an id without a size change;
 // conversion and delete also drop the entry). Avoids re-reading/parsing on every skip.
 const parseCache=new Map();
+function frameTableOk(r,s){
+ if(!r||r.offsets.length<3||r.dur<=0)return false;
+ if(s&&s.duration>2){
+  const md=+s.duration;
+  if(r.dur<md*0.5||r.dur>md*1.5+1)return false;
+ }
+ return true;
+}
 async function songFrames(id,b){
  const size=b instanceof Blob?b.size:b.buf.byteLength,c=parseCache.get(id);
  if(c&&c.size===size)return c.r;
  const u=new Uint8Array(b instanceof Blob?await b.arrayBuffer():b.buf);
  if(!isMp3(u)){parseCache.set(id,{size,r:null});return null}
  const r=parseMp3(u);
+ const s=songs.find(x=>x.id===id);
+ // A frame table that does not match the file's own (browser) duration is not
+ // used for joining: the original file is played instead.
+ if(r&&!frameTableOk(r,s)){parseCache.set(id,{size,r:null});return null}
  if(r){r.offsets=Int32Array.from(r.offsets);parseCache.set(id,{size,r})}
  else parseCache.set(id,{size,r:null});
  return r||null;
@@ -660,11 +762,12 @@ async function buildChunk(i,pos=0,gen){
   parts.push(toBlob(head.b).slice(r.start,r.start+r.offsets[f]));bytes+=r.offsets[f];
   segs.push({i:head.i,id:head.id,start:t,dur:r.dur,head:true});t+=off;
  }
- if(stale())return null;
+ if(stale()||!segs.length||segs[0].id!==songs[i].id)return null;
  const xf=xingFrame(header,offsets,bytes);if(!xf)return null;
  if(stale())return null;
  const blob=new Blob([xf,...parts],{type:'audio/mpeg'});
- return{url:URL.createObjectURL(blob),blob,segs,total:t,count,loop}}
+ const probe=parts[0]?parts[0].slice(0,Math.min(parts[0].size||0,400000)):null;
+ return{url:URL.createObjectURL(blob),blob,segs,total:t,count,loop,probe,songId:segs[0].id}}
 function mediaLive(){
  // Ignore events from a src we just tore down, or from a load that has not been verified yet.
  return mediaReady&&!loadJob&&!initializing&&urlNow&&(audio.src===urlNow||audio.currentSrc===urlNow);
@@ -777,7 +880,15 @@ async function attachChunk(ch,job){
   let ok=false;
   try{ok=await waitChunkMeta(u,job)}catch(e){if(loadJob!==job)return {ok:false,url:u};if(attempt===1)throw e}
   if(loadJob!==job)return {ok:false,url:u};
-  if(ok){await tick();if(loadJob!==job)return {ok:false,url:u};if((audio.currentTime||0)<=0.2){lastAbs=audio.currentTime||0;return {ok:true,url:u}}}
+  if(ok){
+   // Give a kept-over currentTime (setTimeout after src change) a moment to appear.
+   await tick();await tick();
+   await new Promise(r=>setTimeout(r,32));
+   if(loadJob!==job)return {ok:false,url:u};
+   const t=audio.currentTime||0,g=ch.segs&&ch.segs[0];
+   const lim=Math.min(0.2,Math.max(0.05,((g&&g.dur)||1)*0.25));
+   if(t<=lim&&(!g||g.id===job.id)){lastAbs=t;return {ok:true,url:u}}
+  }
   // Browser started mid-stream (kept the old currentTime). Remount a fresh blob; do not seek.
   if(attempt===0&&ch.blob){
    const nu=URL.createObjectURL(ch.blob);
@@ -787,6 +898,48 @@ async function attachChunk(ch,job){
  }
  return {ok:false,url:u,misplaced:true};
 }
+function chunkLooksLikeSong(ch,job,pos){
+ if(!ch||!ch.segs||!ch.segs[0]||!job)return false;
+ const g=ch.segs[0];
+ if(g.id!==job.id||(ch.songId&&ch.songId!==job.id))return false;
+ const s=songs.find(x=>x.id===job.id);
+ if(pos<0.5&&s&&s.duration>2&&(g.dur<s.duration*0.5||g.dur>s.duration*1.5+1))return false;
+ return true;
+}
+async function decodeHeadHz(blob,take){
+ const Ctx=window.OfflineAudioContext||window.webkitOfflineAudioContext;if(!Ctx||!blob)return null;
+ try{
+  const buf=await blob.slice(0,take||400000).arrayBuffer();
+  const ac=new Ctx(1,Math.max(8192,44100),44100);
+  const ab=await ac.decodeAudioData(buf);
+  const ch=ab.getChannelData(0);if(!ch||ch.length<8000)return null;
+  const sr=ab.sampleRate||44100;
+  const start=Math.min(Math.floor(sr*0.05),Math.max(0,ch.length-5000));
+  const n=Math.min(Math.floor(sr*0.1),ch.length-start);
+  if(n<2000)return null;
+  let z=0,last=0,e=0;
+  for(let i=start;i<start+n;i++){const v=ch[i];e+=v*v;if(v>=0&&last<0)z++;last=v}
+  if(e/n<1e-8)return null;
+  return z*(sr/n);
+ }catch(e){return null}
+}
+async function attachedMatchesSong(ch,job){
+ // Decode the audio that is actually attached and compare it with a fresh slice
+ // of the tapped song's own file (the probe taken from that file when the chunk
+ // was built). A stale object URL or leftover joined blob will not match.
+ try{
+  if(!ch||!job||!ch.probe)return null;
+  const srcBlob=(!audio.src||audio.src===ch.url||audio.currentSrc===ch.url)?ch.blob:null;
+  const playing=srcBlob||(audio.src?await(await fetch(audio.src)).blob():null);
+  if(!playing)return null;
+  const a=await decodeHeadHz(playing,500000);
+  const b=await decodeHeadHz(ch.probe,400000);
+  if(a==null||b==null)return null;
+  const d=Math.abs(a-b);
+  if(d>150&&d>0.3*Math.max(a,b))return false;
+  return true;
+ }catch(e){return null}
+}
 function applySingle(i,url){
  dropC();cur=i;urlNow=url;ui();
  const song=songs[i];if(!song)return;
@@ -794,7 +947,8 @@ function applySingle(i,url){
  $('dur').textContent=fmt(song.duration);session(song);render();
 }
 async function singleUrl(id,i){
- if(pre&&pre.i===i&&pre.url&&pre.id===id){const u=pre.url;pre=null;return u}
+ // Only reuse a prefetched object URL if it is still this exact song (id AND slot).
+ if(pre&&pre.url&&pre.id===id&&pre.i===i&&songs[i]&&songs[i].id===id){const u=pre.url;pre=null;return u}
  const blob=await tx('blobs','readonly',st=>st.get(id));
  if(!blob)throw new Error('保存した曲が見つかりません');
  return URL.createObjectURL(await toPlayableBlob(blob));
@@ -825,6 +979,7 @@ async function load(i,play=false,pos=0){
   try{ch=await buildChunk(i,pos,my)}catch(e){console.warn(e);ch=null}
   if(loadJob!==job){if(ch)revokeUnused(ch.url);return false}
   let url,ok=false,err=null;
+  if(ch&&!chunkLooksLikeSong(ch,job,pos)){console.warn('chunk does not start as the tapped song');revokeUnused(ch.url);ch=null}
   if(ch){
    dropPre();ch.gen=my;C=ch;url=ch.url;urlNow=url;ui();
    try{
@@ -832,6 +987,7 @@ async function load(i,play=false,pos=0){
     url=att.url;urlNow=url;if(C)C.url=url;
     ok=!!att.ok;
     if(!ok&&att.misplaced)err=new Error('misplaced');
+    if(ok){const like=await attachedMatchesSong(ch,job);if(like===false){ok=false;err=new Error('mismatch')}}
    }catch(e){err=e;ok=false}
   }else{
    url=await singleUrl(job.id,i);
@@ -849,7 +1005,12 @@ async function load(i,play=false,pos=0){
    try{ok=await restorePosition(pos,job,url)}catch(e){err=e;ok=false}
   }
   if(loadJob!==job)return false;
-  if(ok&&ch){setSeg(0);if((audio.currentTime||0)>0.2||(songs[cur]&&songs[cur].id!==job.id))ok=false}
+  if(ok&&ch){
+   setSeg(0);
+   const g=ch.segs[0],t=audio.currentTime||0;
+   const lim=Math.min(0.2,Math.max(0.05,((g&&g.dur)||1)*0.25));
+   if(t>lim||!g||g.id!==job.id||(songs[cur]&&songs[cur].id!==job.id)||findSeg(t)!==0)ok=false;
+  }
   if(!ok&&ch&&loadJob===job){
    console.warn('chunk did not start at the tapped song');
    revokeUnused(ch.url);ch=null;dropC();
@@ -1081,7 +1242,7 @@ window.addEventListener('pageshow',wakeDB);
 window.addEventListener('focus',wakeDB);
 
 
-const APP_VERSION='v22';
+const APP_VERSION='v23';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');
@@ -1111,5 +1272,14 @@ $('update').onclick=async()=>{
   navigator.serviceWorker.register('sw.js',{updateViaCache:'none'}).then(r=>{window.__reg=r;r.update().catch(()=>{})}).catch(e=>console.warn(e));
   document.addEventListener('visibilitychange',()=>{if(!document.hidden&&window.__reg)window.__reg.update().catch(()=>{})});
  }
+ window.__parseInfo=async function(id){
+  const s=id?songs.find(x=>x.id===id):songs[cur];
+  if(!s)return null;
+  const b=await tx('blobs','readonly',st=>st.get(s.id));
+  if(!b)return {id:s.id,title:s.title,metaDur:s.duration,error:'no blob'};
+  const u=new Uint8Array(b instanceof Blob?await b.arrayBuffer():b.buf);
+  const r=parseMp3(u);
+  return {id:s.id,title:s.title,metaDur:s.duration,parseDur:r&&+r.dur.toFixed(3),start:r&&r.start,end:r&&r.end,frames:r&&r.offsets.length,sr:r&&r.sr,isMp3:isMp3(u),size:u.length};
+ };
  window.__ready=true;
 })();
