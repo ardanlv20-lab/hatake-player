@@ -569,13 +569,13 @@ async function usage(){
   t+=' ／ 使用量 '+(e.usage/1048576).toFixed(1)+'MB'+(e.quota?' / 上限目安 '+(e.quota/1048576/1024).toFixed(1)+'GB':'')}
  $('usage').textContent=t;
 }
-function makeOrder(){order=songs.map((_,i)=>i);if(S.shuffle)for(let i=order.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[order[i],order[j]]=[order[j],order[i]]}}
+function makeOrder(){pendingOrder=null;order=songs.map((_,i)=>i);if(S.shuffle)for(let i=order.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[order[i],order[j]]=[order[j],order[i]]}}
 // ===== 連続再生モード（MP3を1本につなげて再生） =====
 // Avoid a new src at an arbitrary 150MB boundary while iOS has suspended JS.
 // Blob slices keep the joined audio out of JS memory (only one song is parsed at
 // a time). Xing's byte counter is 32-bit; reserve room for its metadata frame.
 const CAP=0xFFFFFFFF-4096;
-let C=null,segIdx=-1,lastAbs=0,userPaused=true,building=0;
+let C=null,segIdx=-1,lastAbs=0,userPaused=true,building=0,pendingOrder=null,freshStart=0,freshGuard=0;
 const BR1=[0,32,40,48,56,64,80,96,112,128,160,192,224,256,320],BR2=[0,8,16,24,32,40,48,56,64,80,96,112,128,144,160],SR=[44100,48000,32000];
 function hdr(u,p){if(u[p]!==0xFF||(u[p+1]&0xE0)!==0xE0)return null;const v=(u[p+1]>>3)&3,l=(u[p+1]>>1)&3;if(v===1||l!==1)return null;
  const bi=u[p+2]>>4,si=(u[p+2]>>2)&3;if(bi===0||bi===15||si===3)return null;const v1=v===3;
@@ -662,15 +662,16 @@ async function buildChunk(i,pos=0,gen){
  if(stale())return null;
  const xf=xingFrame(header,offsets,bytes);if(!xf)return null;
  if(stale())return null;
- return{url:URL.createObjectURL(new Blob([xf,...parts],{type:'audio/mpeg'})),segs,total:t,count,loop}}
+ const blob=new Blob([xf,...parts],{type:'audio/mpeg'});
+ return{url:URL.createObjectURL(blob),blob,segs,total:t,count,loop}}
 function findSeg(t){if(!C)return -1;let r=0;for(let n=0;n<C.segs.length;n++)if(t>=C.segs[n].start-0.05)r=n;return r}
 function setSeg(n){if(!C||n<0||!C.segs[n])return;const g=C.segs[n];segIdx=n;cur=songs.findIndex(x=>x.id===g.id);const s=cur>=0?songs[cur]:null;if(!s)return;
  $('title').textContent=s.title;$('seek').max=Math.floor(g.dur)||0;$('dur').textContent=fmt(g.dur);S.lastId=s.id;persistPos(true);render();session(s);posState()}
-function seekAbs(t){if(!audio.getAttribute('src'))return;try{audio.currentTime=t;lastAbs=t}catch(e){}}
+function seekAbs(t){freshStart=0;if(!audio.getAttribute('src'))return;try{audio.currentTime=t;lastAbs=t}catch(e){}}
 function rel(){return C&&segIdx>=0?audio.currentTime-C.segs[segIdx].start:audio.currentTime}
 function dropC(){if(C){const u=C.url;C=null;segIdx=-1;if(u!==urlNow)revokeUnused(u)}}
 async function rebuild(){if(!C||cur<0)return;const r=rel(),pl=!audio.paused;await load(cur,pl,r)}
-let pre=null,pendingOrder=null;
+let pre=null;
 const toBlob=blob=>blob instanceof Blob?blob:new Blob([blob.buf],{type:blob.type});
 function nextIdx(){
  if(!songs.length)return -1;pendingOrder=null;
@@ -724,6 +725,54 @@ function restorePosition(position,job=loadJob,url=audio.src){
   if(audio.readyState>=1&&audio.currentSrc===url)metadata();
  });
 }
+function resetMedia(){
+ const ended=audio.onended;audio.onended=null;
+ try{audio.removeAttribute('src');audio.load()}catch(e){}
+ audio.onended=ended;
+}
+// Attach a chunk that already starts at the play head. Never seek inside the long
+// joined stream: on iOS, currentTime= can land a whole song off via the Xing TOC,
+// and Safari may also keep the previous currentTime after a src change.
+function waitChunkMeta(url,job){
+ return new Promise((resolve,reject)=>{
+  let settled=false,timer;
+  const current=()=>!job||(loadJob===job&&job.generation===building);
+  const clean=()=>{clearTimeout(timer);audio.removeEventListener('loadedmetadata',ok);audio.removeEventListener('error',fail);if(job&&job.cancel===cancel)job.cancel=null};
+  const done=(v,err)=>{if(settled)return;settled=true;clean();if(err)reject(err);else resolve(v)};
+  const cancel=()=>done(false);
+  const fail=()=>done(false,new Error('音楽ファイルを読み込めませんでした'));
+  const ok=()=>{
+   if(!current()){done(false);return}
+   if(audio.readyState<1||audio.currentSrc!==url)return;
+   done(true);
+  };
+  audio.addEventListener('loadedmetadata',ok);
+  audio.addEventListener('error',fail);
+  if(job)job.cancel=cancel;
+  timer=setTimeout(()=>done(false,new Error('読み込みに時間がかかっています。曲を選び直してください')),20000);
+  if(audio.src!==url)audio.src=url;
+  if(audio.readyState>=1&&audio.currentSrc===url)ok();
+ });
+}
+async function attachChunk(ch,job){
+ lastAbs=0;
+ let u=ch.url;
+ for(let attempt=0;attempt<2;attempt++){
+  if(loadJob!==job)return {ok:false,url:u};
+  resetMedia();
+  let ok=false;
+  try{ok=await waitChunkMeta(u,job)}catch(e){if(loadJob!==job)return {ok:false,url:u};if(attempt===1)throw e}
+  if(loadJob!==job)return {ok:false,url:u};
+  if(ok){await tick();if(loadJob!==job)return {ok:false,url:u};if((audio.currentTime||0)<=0.2){lastAbs=audio.currentTime||0;return {ok:true,url:u}}}
+  // Browser started mid-stream (kept the old currentTime). Remount a fresh blob; do not seek.
+  if(attempt===0&&ch.blob){
+   const nu=URL.createObjectURL(ch.blob);
+   if(u&&u!==nu)revokeUnused(u);
+   u=nu;ch.url=u;
+  }
+ }
+ return {ok:false,url:u,misplaced:true};
+}
 function applySingle(i,url){
  dropC();cur=i;urlNow=url;ui();
  const song=songs[i];if(!song)return;
@@ -744,6 +793,7 @@ async function load(i,play=false,pos=0){
  if(pendingOrder&&pendingOrder[0]===i){order=pendingOrder;pendingOrder=null}
  if(play){wantPlay=true;userPaused=false}
  stopTicker();audio.pause();clearTimeout(pauseTimer);
+ lastAbs=0;
  $('title').textContent=songs[i].title;msg('読み込み中…');
  // Drop the previous joined source before building a new one. A large library
  // would otherwise keep two full copies in memory, and iOS WebKit then closes
@@ -760,26 +810,35 @@ async function load(i,play=false,pos=0){
  try{
   try{ch=await buildChunk(i,pos,my)}catch(e){console.warn(e);ch=null}
   if(loadJob!==job){if(ch)revokeUnused(ch.url);return false}
-  const old=urlNow,oc=C;let url;
+  let url,ok=false,err=null;
   if(ch){
    dropPre();C=ch;url=ch.url;urlNow=url;setSeg(0);ui();
+   try{
+    const att=await attachChunk(ch,job);
+    url=att.url;urlNow=url;if(C)C.url=url;
+    ok=!!att.ok;
+    if(!ok&&att.misplaced)err=new Error('misplaced');
+   }catch(e){err=e;ok=false}
   }else{
    url=await singleUrl(job.id,i);
    if(loadJob!==job){revokeUnused(url);return false}
    applySingle(i,url);
+   try{ok=await restorePosition(pos,job,url)}catch(e){err=e;ok=false}
   }
-  // A chunk already starts at the requested position (within one ~26ms frame).
-  const attach=async (useChunk,u)=>{
-   const ready=restorePosition(useChunk?0:pos,job,u);
-   if(old&&old!==u)revokeUnused(old);if(oc&&oc.url!==old&&oc.url!==u)revokeUnused(oc.url);
-   try{return await ready}catch(e){if(loadJob!==job)return false;throw e}
-  };
-  let ok=false,err=null;
-  try{ok=await attach(!!ch,url)}catch(e){err=e;ok=false}
-  // Joined stream failed (e.g. m4a mislabeled as MP3): play the original file instead.
+  // Joined stream failed to start at the beginning (or is not playable): play the original file.
   if(!ok&&ch&&loadJob===job){
    console.warn(err||'chunk load failed');
-   revokeUnused(ch.url);ch=null;
+   revokeUnused(ch.url);ch=null;dropC();
+   url=await singleUrl(job.id,i);
+   if(loadJob!==job){revokeUnused(url);return false}
+   urlNow=url;applySingle(i,url);
+   try{ok=await restorePosition(pos,job,url)}catch(e){err=e;ok=false}
+  }
+  if(loadJob!==job)return false;
+  if(ok&&ch){setSeg(0);if((audio.currentTime||0)>0.2||(songs[cur]&&songs[cur].id!==job.id))ok=false}
+  if(!ok&&ch&&loadJob===job){
+   console.warn('chunk did not start at the tapped song');
+   revokeUnused(ch.url);ch=null;dropC();
    url=await singleUrl(job.id,i);
    if(loadJob!==job){revokeUnused(url);return false}
    urlNow=url;applySingle(i,url);
@@ -787,8 +846,8 @@ async function load(i,play=false,pos=0){
   }
   if(loadJob!==job)return false;
   if(!ok)throw err||new Error('音楽ファイルを読み込めませんでした');
-  loadJob=null;lastAbs=audio.currentTime;
-  if(!songs[cur])throw new Error('曲を読み込めませんでした');
+  loadJob=null;lastAbs=audio.currentTime||0;freshStart=ch?performance.now():0;
+  if(!songs[cur]||songs[cur].id!==job.id)throw new Error('曲を読み込めませんでした');
   S.lastId=songs[cur].id;S.lastPos=rel();lastSave=Date.now();save();updateProgress();
   msg(ch?'連続再生モード（'+ch.count+'曲をつなげて再生中）':'通常モード（MP3以外の曲は1曲ずつ再生）');
   if(!ch)setTimeout(prefetch,0);
@@ -849,6 +908,17 @@ function posState(){
 function session(s){if(!('mediaSession' in navigator))return;
  navigator.mediaSession.metadata=new MediaMetadata({title:s.title,artist:'畑プレーヤー',artwork:[192,512].map(size=>({src:new URL('icon-'+size+'.png',location.href).href,sizes:size+'x'+size,type:'image/png'}))});
 }
+function resumeJoined(){
+ const wrap=C&&C.loop&&lastAbs>C.total-3;
+ if(!(C&&lastAbs>1&&audio.currentTime<1&&!wrap))return false;
+ if(loadJob)return true;
+ const n=findSeg(lastAbs),g=n>=0?C.segs[n]:null;
+ const i=g?songs.findIndex(s=>s.id===g.id):cur;
+ const pos=g?Math.max(0,lastAbs-g.start):0;
+ if(i<0)return false;
+ load(i,true,pos);
+ return true;
+}
 let playAttempt=0;
 function playbackState(state){if('mediaSession' in navigator)navigator.mediaSession.playbackState=state;posState()}
 function playbackSession(){
@@ -869,12 +939,10 @@ function startAudio(recover=true){
   wantPlay=true;userPaused=false;msg('読み込み中… 再生を予約しました');return Promise.resolve();
  }
  wantPlay=false;
- // Restore a resource that iOS reset to zero, synchronously before remote play().
- const wrap=C&&C.loop&&lastAbs>C.total-3;
- if(lastAbs>1&&audio.currentTime<1&&!wrap){
-  const target=Number.isFinite(audio.duration)?Math.min(lastAbs,Math.max(0,audio.duration-0.01)):lastAbs;
-  try{seekAbs(target)}catch(e){}
- }
+ // iOS sometimes resets currentTime to 0. For a joined stream, do not seek back
+ // inside the long blob (Xing TOC can land in a different song): rebuild a chunk
+ // that starts at the saved position instead.
+ if(resumeJoined())return Promise.resolve();
  const attempt=++playAttempt;userPaused=false;clearTimeout(pauseTimer);playbackSession();
  // This must be synchronous in the Media Session action's call stack. No DB awaits.
  let playing;try{playing=audio.play()}catch(e){playing=Promise.reject(e)}
@@ -953,6 +1021,16 @@ audio.addEventListener('seeked',()=>{updateProgress();if(!audio.paused)startTick
 function updateProgress(){
  if(loadJob)return;
  let t=audio.currentTime;if(!Number.isFinite(t)||t<0)return;
+ if(C&&freshStart){
+  const elapsed=(performance.now()-freshStart)/1000;
+  if(elapsed<1&&lastAbs<1&&t>elapsed+0.4){
+   freshStart=0;
+   const g=C.segs[0],i=g?songs.findIndex(s=>s.id===g.id):cur;
+   if(i>=0&&!loadJob&&freshGuard++<1)load(i,playingNow(),0);
+   return;
+  }
+  if(elapsed>=1){freshStart=0;freshGuard=0}
+ }
  if(C){
   if(t<1&&lastAbs>5&&!(C.loop&&lastAbs>C.total-3)&&!audio.paused&&document.hidden){}else{
    const n=findSeg(t);if(n!==segIdx)setSeg(n);lastAbs=t}
@@ -972,8 +1050,8 @@ document.addEventListener('visibilitychange',()=>{
  if(loadJob||initializing)return;
  if(document.hidden){persistPos(true);return}
  if(cur<0||userPaused)return;
- const wrap=C&&C.loop&&lastAbs>C.total-3;
- if(audio.currentTime<1&&lastAbs>5&&!wrap)seekAbs(lastAbs);
+ if(resumeJoined())return;
+ if(audio.currentTime<1&&lastAbs>5){try{seekAbs(lastAbs)}catch(e){}}
  if(audio.paused)startAudio();else startTicker();
 });
 
@@ -982,7 +1060,7 @@ window.addEventListener('pageshow',wakeDB);
 window.addEventListener('focus',wakeDB);
 
 
-const APP_VERSION='v20';
+const APP_VERSION='v21';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');
