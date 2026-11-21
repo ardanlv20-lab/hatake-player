@@ -50,6 +50,32 @@ function isTargetMp3(u){
  if(!isMp3(u))return false;
  const r=parseMp3(u);return !!r&&r.sr===TARGET_SR&&r.v===3&&r.mode!==3;
 }
+// MIME from the file picker is untrusted (iOS often reports m4a as audio/mpeg).
+// Bytes decide: only real MP3s are joined; other files get a type the player can use.
+function sniffType(u,fallback){
+ if(!u||u.length<12)return fallback||'application/octet-stream';
+ if(isMp3(u))return 'audio/mpeg';
+ const tag=String.fromCharCode(...u.subarray(0,12));
+ if(tag.slice(4,8)==='ftyp')return 'audio/mp4';
+ if(/^RIFF/.test(tag)&&String.fromCharCode(...u.subarray(8,12))==='WAVE')return 'audio/wav';
+ if(/^fLaC/.test(tag))return 'audio/flac';
+ if(/^OggS/.test(tag))return 'audio/ogg';
+ if(/^FORM/.test(tag))return 'audio/aiff';
+ if(/^caff/.test(tag))return 'audio/x-caf';
+ return fallback||'application/octet-stream';
+}
+async function toPlayableBlob(b){
+ const buf=b instanceof Blob?await b.arrayBuffer():b.buf;
+ return new Blob([buf],{type:sniffType(new Uint8Array(buf),b&&b.type)});
+}
+function playErrorMessage(e){
+ const m=(e&&(e.message||e.name))||'';
+ if(/時間/.test(m))return '読み込みに時間がかかっています。曲を選び直してください';
+ if(/見つかりません|中止/.test(m))return m;
+ if(!m||/TypeError|undefined|null is not|Cannot read|AbortError|NotSupported|NotAllowed|The operation|EncodingError|DOMException/i.test(m))
+  return '音楽ファイルを読み込めませんでした';
+ return m;
+}
 const MAX_CONVERT_SEC=30*60; // Decoded PCM of longer files can exhaust iPhone memory.
 // Length in seconds without a media element for MP3s; falls back to getDuration.
 async function lengthOf(u,type){const r=isMp3(u)?parseMp3(u):null;return r?r.dur:await getDuration(new Blob([u],{type}))}
@@ -448,7 +474,8 @@ async function addFiles(files){
   const types={mp3:'audio/mpeg',m4a:'audio/mp4',aac:'audio/aac',wav:'audio/wav',mp4:'audio/mp4',caf:'audio/x-caf',aif:'audio/aiff',aiff:'audio/aiff',flac:'audio/flac',ogg:'audio/ogg',opus:'audio/ogg'};
   if(!(f.type||'').startsWith('audio/')&&!types[ext]){msg('音楽ファイルではないのでスキップ: '+f.name);continue}
   let buf;try{buf=await f.arrayBuffer()}catch(e){msg('読み込めませんでした（iCloudにあるファイルは先にダウンロードしてください）: '+f.name);continue}
-  const type=(f.type&&f.type.startsWith('audio/'))?f.type:(types[ext]||'audio/mpeg');
+  const declared=(f.type&&f.type.startsWith('audio/'))?f.type:(types[ext]||'audio/mpeg');
+  const type=sniffType(new Uint8Array(buf),declared);
   const blob=new Blob([buf],{type});
   const id=Date.now().toString(36)+Math.random().toString(36).slice(2,7);
   const meta={id,title:f.name.replace(/\.[^.]+$/,''),duration:await getDuration(blob),size:blob.size,added:Date.now()};
@@ -513,7 +540,7 @@ function xingFrame(header,offsets,bytes){
  const frameHeader=header.slice();frameHeader[1]|=1; // No CRC in this new frame.
  const v=(frameHeader[1]>>3)&3,mono=(frameHeader[3]>>6)===3;
  frameHeader[2]=(frameHeader[2]&0x0D)|((v===3?9:8)<<4); // 128/64 kbps, no padding.
- const size=hdr(frameHeader,0).len,frame=new Uint8Array(size);
+ const h=hdr(frameHeader,0);if(!h)return null;const size=h.len,frame=new Uint8Array(size);
  frame.set(frameHeader);const at=4+(v===3?(mono?17:32):(mono?9:17));
  frame.set([88,105,110,103],at); // Xing
  const view=new DataView(frame.buffer),totalBytes=bytes+size;
@@ -531,9 +558,12 @@ const parseCache=new Map();
 async function songFrames(id,b){
  const size=b instanceof Blob?b.size:b.buf.byteLength,c=parseCache.get(id);
  if(c&&c.size===size)return c.r;
- const r=parseMp3(new Uint8Array(b instanceof Blob?await b.arrayBuffer():b.buf));
+ const u=new Uint8Array(b instanceof Blob?await b.arrayBuffer():b.buf);
+ if(!isMp3(u)){parseCache.set(id,{size,r:null});return null}
+ const r=parseMp3(u);
  if(r){r.offsets=Int32Array.from(r.offsets);parseCache.set(id,{size,r})}
- return r;
+ else parseCache.set(id,{size,r:null});
+ return r||null;
 }
 // The chunk always begins exactly at the requested song position (frame-accurate, byte 0),
 // so a skip/seek never relies on the browser seeking inside a long joined stream: Safari
@@ -547,7 +577,9 @@ async function buildChunk(i,pos=0){
   if((j>0&&S.repeat==='one')||(k+j>=order.length&&S.repeat!=='all'))break;
   const idx=order[(k+j)%order.length],s=songs[idx];
   const b=await tx('blobs','readonly',st=>st.get(s.id));if(!b)break;
-  const type=b instanceof Blob?b.type:b.type;if(type&&type!=='audio/mpeg'&&type!=='audio/mp3'){if(j===0)return null;break}
+  const type=b instanceof Blob?b.type:b.type;
+  // MIME is only a hint: iOS may label m4a as audio/mpeg. songFrames requires real MP3 bytes.
+  if(type&&type!=='audio/mpeg'&&type!=='audio/mp3'&&type!=='audio/x-mpeg'){if(j===0)return null;break}
   const r=await songFrames(s.id,b);
   if(!r||(sr&&(r.sr!==sr||r.v!==version||(r.mode===3)!==(mode===3)))||(bytes+(r.end-r.start)>CAP)){if(j===0)return null;break}
   sr=r.sr;version=r.v;mode=r.mode;if(!header)header=r.header;
@@ -566,9 +598,10 @@ async function buildChunk(i,pos=0){
   parts.push(toBlob(head.b).slice(r.start,r.start+r.offsets[f]));bytes+=r.offsets[f];
   segs.push({i:head.i,id:head.id,start:t,dur:r.dur,head:true});t+=off;
  }
- return{url:URL.createObjectURL(new Blob([xingFrame(header,offsets,bytes),...parts],{type:'audio/mpeg'})),segs,total:t,count,loop}}
+ const xf=xingFrame(header,offsets,bytes);if(!xf)return null;
+ return{url:URL.createObjectURL(new Blob([xf,...parts],{type:'audio/mpeg'})),segs,total:t,count,loop}}
 function findSeg(t){if(!C)return -1;let r=0;for(let n=0;n<C.segs.length;n++)if(t>=C.segs[n].start-0.05)r=n;return r}
-function setSeg(n){if(!C||n<0)return;const g=C.segs[n];segIdx=n;cur=songs.findIndex(x=>x.id===g.id);const s=songs[cur];if(!s)return;
+function setSeg(n){if(!C||n<0||!C.segs[n])return;const g=C.segs[n];segIdx=n;cur=songs.findIndex(x=>x.id===g.id);const s=cur>=0?songs[cur]:null;if(!s)return;
  $('title').textContent=s.title;$('seek').max=Math.floor(g.dur)||0;$('dur').textContent=fmt(g.dur);S.lastId=s.id;if(!loadJob)save();render();session(s);posState()}
 function seekAbs(t){if(!audio.getAttribute('src'))return;try{audio.currentTime=t;lastAbs=t}catch(e){}}
 function rel(){return C&&segIdx>=0?audio.currentTime-C.segs[segIdx].start:audio.currentTime}
@@ -591,7 +624,7 @@ async function prefetch(){
  dropPre();if(n<0)return;
  const tok=pre={i:n,id:songs[n].id,url:null};
  try{const blob=await tx('blobs','readonly',st=>st.get(tok.id));
-  if(pre!==tok||!blob)return;tok.url=URL.createObjectURL(toBlob(blob))}catch(e){if(pre===tok)pre=null}
+  if(pre!==tok||!blob)return;tok.url=URL.createObjectURL(await toPlayableBlob(blob))}catch(e){if(pre===tok)pre=null}
 }
 // Attach listeners before assigning src, and also handle already-loaded metadata.
 // A new load cancels both the old metadata wait and its seeked callback.
@@ -628,6 +661,18 @@ function restorePosition(position,job=loadJob,url=audio.src){
   if(audio.readyState>=1&&audio.currentSrc===url)metadata();
  });
 }
+function applySingle(i,url){
+ dropC();cur=i;urlNow=url;ui();
+ const song=songs[i];if(!song)return;
+ $('title').textContent=song.title;$('seek').max=Math.floor(song.duration)||0;
+ $('dur').textContent=fmt(song.duration);session(song);render();
+}
+async function singleUrl(id,i){
+ if(pre&&pre.i===i&&pre.url&&pre.id===id){const u=pre.url;pre=null;return u}
+ const blob=await tx('blobs','readonly',st=>st.get(id));
+ if(!blob)throw new Error('保存した曲が見つかりません');
+ return URL.createObjectURL(await toPlayableBlob(blob));
+}
 async function load(i,play=false,pos=0){
  if(i<0||i>=songs.length)return false;
  const previous=loadJob,my=++building;
@@ -639,35 +684,44 @@ async function load(i,play=false,pos=0){
  $('title').textContent=songs[i].title;msg('読み込み中…');
  let ch=null;
  try{
-  try{ch=await buildChunk(i,pos)}catch(e){console.warn(e)}
+  try{ch=await buildChunk(i,pos)}catch(e){console.warn(e);ch=null}
   if(loadJob!==job){if(ch)revokeUnused(ch.url);return false}
   const old=urlNow,oc=C;let url;
   if(ch){
    dropPre();C=ch;url=ch.url;urlNow=url;setSeg(0);ui();
   }else{
-   if(pre&&pre.i===i&&pre.url&&pre.id===job.id){url=pre.url;pre=null}
-   else{
-    const blob=await tx('blobs','readonly',st=>st.get(job.id));
-    if(loadJob!==job)return false;
-    if(!blob)throw new Error('保存した曲が見つかりません');
-    url=URL.createObjectURL(toBlob(blob));
-   }
-   dropC();cur=i;urlNow=url;ui();
-   const song=songs[i];$('title').textContent=song.title;$('seek').max=Math.floor(song.duration)||0;
-   $('dur').textContent=fmt(song.duration);session(song);render();
+   url=await singleUrl(job.id,i);
+   if(loadJob!==job){revokeUnused(url);return false}
+   applySingle(i,url);
   }
   // A chunk already starts at the requested position (within one ~26ms frame).
-  const ready=restorePosition(ch?0:pos,job,url);
-  if(old&&old!==url)revokeUnused(old);if(oc&&oc.url!==old&&oc.url!==url)revokeUnused(oc.url);
-  if(!await ready||loadJob!==job)return false;
+  const attach=async (useChunk,u)=>{
+   const ready=restorePosition(useChunk?0:pos,job,u);
+   if(old&&old!==u)revokeUnused(old);if(oc&&oc.url!==old&&oc.url!==u)revokeUnused(oc.url);
+   try{return await ready}catch(e){if(loadJob!==job)return false;throw e}
+  };
+  let ok=false,err=null;
+  try{ok=await attach(!!ch,url)}catch(e){err=e;ok=false}
+  // Joined stream failed (e.g. m4a mislabeled as MP3): play the original file instead.
+  if(!ok&&ch&&loadJob===job){
+   console.warn(err||'chunk load failed');
+   revokeUnused(ch.url);ch=null;
+   url=await singleUrl(job.id,i);
+   if(loadJob!==job){revokeUnused(url);return false}
+   urlNow=url;applySingle(i,url);
+   try{ok=await restorePosition(pos,job,url)}catch(e){err=e;ok=false}
+  }
+  if(loadJob!==job)return false;
+  if(!ok)throw err||new Error('音楽ファイルを読み込めませんでした');
   loadJob=null;lastAbs=audio.currentTime;
+  if(!songs[cur])throw new Error('曲を読み込めませんでした');
   S.lastId=songs[cur].id;S.lastPos=rel();save();updateProgress();
   msg(ch?'連続再生モード（'+ch.count+'曲をつなげて再生中）':'通常モード（MP3以外の曲は1曲ずつ再生）');
   if(!ch)setTimeout(prefetch,0);
   if(wantPlay&&!initializing){wantPlay=false;startAudio()}
   return true;
  }catch(e){
-  if(loadJob===job){loadJob=null;wantPlay=false;userPaused=true;msg(e.message||'曲を読み込めませんでした');playbackState('paused')}
+  if(loadJob===job){loadJob=null;wantPlay=false;userPaused=true;msg(playErrorMessage(e));playbackState('paused')}
   return false;
  }
 }
@@ -822,7 +876,8 @@ function updateProgress(){
  if(C){
   if(t<1&&lastAbs>5&&!(C.loop&&lastAbs>C.total-3)&&!audio.paused&&document.hidden){}else{
    const n=findSeg(t);if(n!==segIdx)setSeg(n);lastAbs=t}
-  const g=C.segs[Math.max(segIdx,0)],r=Math.max(0,Math.min(g.dur,t-g.start));
+  const g=C.segs[Math.max(0,Math.min(segIdx,C.segs.length-1))];if(!g)return;
+  const r=Math.max(0,Math.min(g.dur,t-g.start));
   if(!dragging){$('cur').textContent=fmt(r);$('seek').value=Math.floor(r)}
  }else{
   if(!dragging){$('cur').textContent=fmt(t);$('seek').value=Math.floor(t)}lastAbs=t;
@@ -843,7 +898,7 @@ document.addEventListener('visibilitychange',()=>{
 
 window.addEventListener('pagehide',()=>{if(cur>=0&&!loadJob){S.lastPos=rel();save();posState()}});
 
-const APP_VERSION='v18';
+const APP_VERSION='v19';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');
