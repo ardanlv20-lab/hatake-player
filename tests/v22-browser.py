@@ -48,7 +48,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     session=context.new_cdp_session(page)
     session.send('Emulation.setCPUThrottlingRate',{'rate':4})
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v23'
+    assert page.locator('#ver').inner_text()=='v24'
 
     page.evaluate("""async ([firsts,filler,n])=>{
       S.shuffle=false;S.repeat='none';save();ui();

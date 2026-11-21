@@ -42,12 +42,14 @@ body.dark li.cur .t{color:var(--acc)}
 li button{min-height:56px;min-width:56px;font-size:20px}
 #usage{font-size:16px;margin:8px 0}
 #msg{font-size:16px;min-height:22px}
+#diag{font-size:13px;font-weight:normal;opacity:.75;min-height:18px;margin-top:4px}
 </style>
 </head>
 <body>
 <h1>🎵 畑プレーヤー <button id="dark" aria-label="表示切替">🌙</button></h1>
 <div id="now">
   <div id="title">曲を追加してください</div>
+  <div id="diag"></div>
   <input id="seek" type="range" min="0" max="0" step="1" value="0" aria-label="再生位置">
   <div id="times"><span id="cur">0:00</span><span id="dur">0:00</span></div>
   <div class="row" id="ctrl">
@@ -67,10 +69,10 @@ li button{min-height:56px;min-width:56px;font-size:20px}
 </div>
 <div id="msg"></div>
 <div id="usage"></div>
-<div style="font-size:14px;margin:12px 0;opacity:.8">バージョン <span id="ver">v23</span> <button class="btn" id="update" style="font-size:14px;padding:6px 10px">アプリを更新</button></div>
+<div style="font-size:14px;margin:12px 0;opacity:.8">バージョン <span id="ver">v24</span> <button class="btn" id="update" style="font-size:14px;padding:6px 10px">アプリを更新</button> <button class="btn" id="reset" style="font-size:14px;padding:6px 10px">リセット</button></div>
 <ul id="list"></ul>
 <audio id="audio" preload="auto" playsinline></audio>
-<script src="lame.min.js?v=23"></script>
-<script src="app.js?v=23"></script>
+<script src="lame.min.js?v=24"></script>
+<script src="app.js?v=24"></script>
 </body>
 </html>

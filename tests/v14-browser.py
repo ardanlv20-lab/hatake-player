@@ -31,7 +31,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v23'
+    assert page.locator('#ver').inner_text()=='v24'
     assert page.locator('#convert').inner_text()=='形式と音量をそろえる'
     assert page.evaluate("getComputedStyle(document.getElementById('convert')).minHeight")=='64px'
     # Encoder output: 44.1kHz MPEG-1, 2ch never mono; record lamejs channel mode.
@@ -59,7 +59,8 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     assert page.evaluate('audio.paused')
     page.click('#convert')
     page.wait_for_function("!document.getElementById('convert').disabled && "+MSG+".includes('曲を44.1kHzステレオのMP3にそろえました')",timeout=90000)
-    page.wait_for_function("C && C.segs.length===5",timeout=20000)
+    n=page.evaluate("async ()=>{const ch=await buildChunk(0,0);const n=ch&&ch.count;if(ch&&ch.url)revokeUnused(ch.url);return n||0}")
+    assert n==5,('all 5 normalized songs should be joinable',n)
     info=page.evaluate(INSPECT,None)
     assert info['s44']['size']==len(raw['s44']) and info['s44']['bytes']==list(raw['s44'][:64]),'44.1k stereo mp3 must stay byte-identical'
     for k in ('s48','m44','v22','song'):
@@ -85,7 +86,8 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     order_titles=page.evaluate("songs.map(s=>s.title)")
     assert order_titles==['s44','s48','m44','v22','song','昔44','昔48','昔モノラル','昔22k','昔m4a'],order_titles
     assert page.evaluate('cur')==0 and page.evaluate('audio.paused'),'no surprise autoplay'
-    page.wait_for_function("!loadJob && C && C.segs.length===songs.length && songs.length===10",timeout=20000)
+    n=page.evaluate("async ()=>{const ch=await buildChunk(0,0);const n=ch&&ch.count;if(ch&&ch.url)revokeUnused(ch.url);return n||0}")
+    assert n==10,('all 10 songs should be joinable',n)
     page.click('#convert')
     page.wait_for_function(MSG+"==='そろえる必要がある曲はありません'",timeout=20000)
     # Idle add into non-empty library: normalized, no autoload.
@@ -99,17 +101,22 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.click('#convert')
     page.wait_for_function("!document.getElementById('convert').disabled && "+MSG+".includes('曲を44.1kHzステレオのMP3にそろえました')",timeout=60000)
     page.evaluate("load(0,false)")
-    page.wait_for_function("!loadJob && C && C.segs.length===11",timeout=20000)
+    page.wait_for_function("!loadJob && cur===0 && audio.readyState>=1",timeout=20000)
+    assert page.evaluate('!C'),'a list/select load must be the original file, not a joined chunk'
+    n=page.evaluate("async ()=>{const ch=await buildChunk(0,0);const n=ch&&ch.count;if(ch&&ch.url)revokeUnused(ch.url);return n||0}")
+    assert n==11,('all 11 songs should be joinable',n)
     # Offline: encoder from SW cache; normalizes a 48k MP3.
     ctx2=browser.new_context();pg=ctx2.new_page();pg.on('pageerror',lambda e:errors.append(str(e)))
     pg.goto(url);pg.wait_for_function('window.__ready');pg.wait_for_function('navigator.serviceWorker.controller!==null',timeout=20000)
     ctx2.set_offline(True);pg.reload();pg.wait_for_function('window.__ready')
-    assert pg.locator('#ver').inner_text()=='v23'
+    assert pg.locator('#ver').inner_text()=='v24'
     pg.set_input_files('#file',[s48,s44])
     pg.wait_for_function("songs.length===2 && cur===0 && !loadJob && "+MSG+".includes('曲を取り込みました')",timeout=60000)
     assert '形式と音量をそろえる' in pg.evaluate(MSG)
     pg.click('#convert')
-    pg.wait_for_function("!document.getElementById('convert').disabled && C && C.segs.length===2",timeout=60000)
+    pg.wait_for_function("!document.getElementById('convert').disabled && document.getElementById('msg').textContent.includes('そろえました')",timeout=60000)
+    n=pg.evaluate("async ()=>{const ch=await buildChunk(0,0);const n=ch&&ch.count;if(ch&&ch.url)revokeUnused(ch.url);return n||0}")
+    assert n==2,('offline converted pair should be joinable',n)
     assert '曲を44.1kHzステレオのMP3にそろえました' in pg.evaluate(MSG)
     ctx2.close()
     assert not errors,errors

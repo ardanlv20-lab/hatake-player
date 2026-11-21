@@ -34,7 +34,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v23'
+    assert page.locator('#ver').inner_text()=='v24'
 
     # iOS-like library: m4a and wav stored as audio/mpeg (picker often lies); mixed rates/channels.
     items=[
@@ -68,9 +68,12 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
         if play: assert s['paused'] is False,(label,'expected playing',s)
         return s
 
-    # First song: the two 44.1k stereo MP3s should join.
+    # First song: a list tap plays the original file (not a joined chunk).
     s=load_ok(0,True,'first')
-    assert s['C'] and s['C']['count']>=2 and s['C']['first']==0,s
+    assert s['C'] is None,('tap must be single-file',s)
+    assert '単曲' in (s['msg'] or '') or '単曲' in page.locator('#diag').inner_text(),s
+    n=page.evaluate("async ()=>{const ch=await buildChunk(0,0);const n=ch&&ch.count;if(ch&&ch.url)revokeUnused(ch.url);return n||0}")
+    assert n>=2,('the two 44.1k stereo MP3s should still be joinable afterwards',n)
     page.wait_for_timeout(200)
 
     # Tap every other song (playing): mislabeled m4a/wav must fall back and play, not error.
@@ -79,9 +82,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
         print('tap',title,s['msg'],'C',s['C'])
         if title in ('m4a-lying','wav-lying','m4a-ok'):
             assert s['C'] is None,('must not treat non-MP3 as a joined stream',title,s)
-            assert '通常モード' in s['msg'],s
-        if title=='s44':
-            assert s['C'] and s['C']['count']>=2,s
+        assert s['C'] is None,('a list tap always plays the original file',title,s)
 
     # Backward, paused, then play another, then skip buttons.
     load_ok(5,False,'paused-wav')
@@ -111,12 +112,13 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.wait_for_function("!document.getElementById('convert').disabled && "+MSG+".includes('そろえました')",timeout=120000)
     print('after convert',page.evaluate(MSG))
     s=load_ok(0,True,'after-convert-0')
-    # All 8 should now be joinable 44.1k stereo MP3s.
-    page.wait_for_function("C && C.segs && C.segs.length===songs.length",timeout=20000)
+    assert s['C'] is None,s
+    n=page.evaluate("async ()=>{const ch=await buildChunk(0,0);const n=ch&&ch.count;if(ch&&ch.url)revokeUnused(ch.url);return n||0}")
+    assert n==8,('all 8 converted songs should be joinable',n)
     for i in (2,5,7,1):
         load_ok(i,True,'post-convert-'+str(i))
     assert page.evaluate("songs.every(s=>true)")  # still 8
     assert errors==[] or all('Service Worker' in e for e in errors),errors
-    print('PASS v19: mislabeled m4a/wav no longer show 音楽ファイルを読み込めませんでした, every list tap plays (mix of 44.1k/48k/mono/m4a/wav, playing/paused/next/prev), 44.1k songs still join, sniffType fixes MIME, convert then tap still works')
+    print('PASS v19: mislabeled m4a/wav no longer show 音楽ファイルを読み込めませんでした, every list tap plays (mix of 44.1k/48k/mono/m4a/wav, playing/paused/next/prev), taps are single-file, 44.1k songs remain joinable after the current song, sniffType fixes MIME, convert then tap still works')
     browser.close()
 server.shutdown()

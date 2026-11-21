@@ -59,7 +59,7 @@ def run_suite(browser_type, label):
         page=context.new_page();errors=[]
         page.on('pageerror',lambda e:errors.append(str(e)))
         page.goto(url);page.wait_for_function('window.__ready')
-        assert page.locator('#ver').inner_text()=='v23'
+        assert page.locator('#ver').inner_text()=='v24'
         assert page.locator('#cancel').is_hidden()
         page.evaluate(HOOK)
 
@@ -74,7 +74,8 @@ def run_suite(browser_type, label):
         assert not S48['target'],S48
         assert not L['meta'].get('loudChecked') and not Q['meta'].get('loudChecked')
         # Already-target songs can join; the 48k one must not force a convert on import.
-        assert page.evaluate('C && C.segs.length>=1')
+        n=page.evaluate("async ()=>{const ch=await buildChunk(0,0);const n=ch&&ch.count;if(ch&&ch.url)revokeUnused(ch.url);return n||0}")
+        assert n>=1,('target songs should still be joinable',n)
 
         # Button: cancel mid-run. Three 40s quiet songs so the first takes a while.
         context.close()

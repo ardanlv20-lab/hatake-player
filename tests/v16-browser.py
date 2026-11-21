@@ -16,14 +16,29 @@ def ff(*a):subprocess.run(['ffmpeg','-hide_banner','-loglevel','error',*a],check
 def tone(k):return f"aevalsrc=0.5*sin(2*PI*({BASE+100*k}+5*floor(t/10))*t):s=44100:d={DUR}"
 def freq(k,pos):return BASE+100*k+5*(int(pos)//10)
 HELPERS="""() => {
-  // Zero-crossing frequency of the first decoded audio of the current chunk (skips the Xing frame).
-  window.chunkFreq=async (from=0.1,len=0.5)=>{const b=await (await fetch(C.url)).blob();
-    const ac=new OfflineAudioContext(2,44100,44100);const ab=await ac.decodeAudioData(await b.slice(0,600000).arrayBuffer());
-    const d=ab.getChannelData(0),s=Math.floor(from*ab.sampleRate),e=s+Math.floor(len*ab.sampleRate);let z=0;
-    for(let i=s+1;i<e;i++)if((d[i-1]<0)!==(d[i]<0))z++;return z/2/len};
+  // Zero-crossing frequency of the attached src at time t (original file or joined chunk).
+  window._dec=null;
+  window.toneAt=async (t=0.1,len=0.5)=>{
+    const url=audio.src||audio.currentSrc;if(!url)return 0;
+    if(!_dec||_dec.url!==url){
+      const b=await (await fetch(url)).blob();
+      const take=t>8?b.size:Math.min(b.size,900000);
+      const ac=new OfflineAudioContext(2,44100,44100);
+      const ab=await ac.decodeAudioData(await b.slice(0,take).arrayBuffer());
+      _dec={url,ab,full:take===b.size};
+    }
+    if(!_dec.full&&t>8){_dec=null;return toneAt(t,len)}
+    const ab=_dec.ab,d=ab.getChannelData(0),sr=ab.sampleRate;
+    const s=Math.max(0,Math.floor(t*sr)),e=Math.min(d.length,s+Math.floor(len*sr));
+    if(e-s<sr*0.2)return 0;
+    let z=0;for(let i=s+1;i<e;i++)if((d[i-1]<0)!==(d[i]<0))z++;
+    return z/2/((e-s)/sr);
+  };
+  window.chunkFreq=async (from=0.1,len=0.5)=>toneAt(from,len);
   window.settled=()=>new Promise(r=>{const iv=setInterval(()=>{if(!loadJob&&audio.readyState>=1){clearInterval(iv);r()}},20)});
-  window.state=async ()=>{await settled();return {cur,rel:rel(),first:C.segs[0].i,start:C.segs[0].start,count:C.count,segs:C.segs.length,loop:C.loop,
-    paused:audio.paused,f:await chunkFreq(),src:audio.src}};
+  window.state=async ()=>{await settled();const join=!!C;
+    return {cur,rel:rel(),first:join?C.segs[0].i:cur,start:join?C.segs[0].start:0,count:join?C.count:1,segs:join?C.segs.length:1,
+      loop:!!(join?C.loop:audio.loop),paused:audio.paused,f:await toneAt(join?0.1:Math.max(0.1,rel()),0.5),src:audio.src,mode:join?'join':'single'}};
 }"""
 with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     t=pathlib.Path(tmp);names=[]
@@ -41,7 +56,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.route('**/fixture/*',lambda r:r.fulfill(path=str(t/r.request.url.split('/')[-1]),content_type='audio/mpeg'))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v23'
+    assert page.locator('#ver').inner_text()=='v24'
     # Pre-existing library (as if imported earlier), then two m4a imported -> converted by the app.
     page.evaluate("""async (names)=>{for(const [k,n] of names.entries()){const buf=await (await fetch('fixture/'+n)).arrayBuffer();const id='s'+k;
       await tx('blobs','readwrite',st=>st.put({buf,type:'audio/mpeg'},id));const r=parseMp3(new Uint8Array(buf));
@@ -54,12 +69,16 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.evaluate(HELPERS)
     page.evaluate("() => { load(0,false) }")
     s=page.evaluate('state()')
-    assert s['count']==N+2 and s['first']==0 and s['paused'],s
+    assert s['first']==0 and s['paused'] and s['mode']=='single',s
+    n=page.evaluate("async ()=>{const ch=await buildChunk(0,0);const n=ch&&ch.count;if(ch&&ch.url)revokeUnused(ch.url);return n||0}")
+    assert n==N+2,('library should still be joinable after the current song',n)
     def check(s,k,pos,tol=0.15,label=''):
         exp=freq(k,pos)
         assert s['cur']==k and s['first']==k,(label,'wrong song',s,k)
-        assert abs(s['rel']-pos)<=tol and abs(-s['start']-pos)<0.03,(label,'wrong position',s,pos)
-        assert abs(s['f']-exp)<2.5,(label,'chunk does not start with the target audio',s,exp)
+        assert abs(s['rel']-pos)<=tol,(label,'wrong position',s,pos)
+        if s.get('mode')=='join':
+            assert abs(-s['start']-pos)<0.03,(label,'join start',s,pos)
+        assert abs(s['f']-exp)<2.5,(label,'audible tone does not match the target',s,exp)
     # Next button x3 (songs with different bitrates), then lock-screen next/prev.
     for k in (1,2,3):
         page.click('#next');s=page.evaluate('state()');check(s,k,0,0.6,'next');assert not s['paused']
@@ -86,35 +105,44 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.evaluate('seekSong(30)');page.evaluate('state()')
     page.click('#prev');s=page.evaluate('state()');check(s,14,0,0.6,'prev restart')
     page.click('#prev');s=page.evaluate('state()');check(s,13,0,0.6,'prev to previous')
-    # Unattended playback still crosses song boundaries inside one stream (no src change).
-    page.evaluate(f'seekSong({DUR}-1.0)');s=page.evaluate('state()');src=s['src']
-    page.evaluate('startAudio()')
-    page.wait_for_function(f"cur===14 && rel()>0.5 && !audio.paused",timeout=10000)
-    assert page.evaluate('audio.src')==src,'auto-advance changed src'
-    # Repeat one with a mid-song start: head of the song appended so the native loop is seamless.
+    # Unattended: the current original file may swap once into a join that starts at the next song;
+    # after that, later songs share that joined src.
+    page.evaluate(f'seekSong({DUR}-1.0)');page.evaluate('startAudio()')
+    page.wait_for_function("cur===14 && !loadJob && mediaReady && !audio.paused",timeout=15000)
+    s=page.evaluate('state()')
+    assert s['cur']==14,('should advance into the next song',s)
+    if s['mode']=='join' and s['count']>=2:
+        src=s['src']
+        page.evaluate('seekAbs(C.segs[0].start+C.segs[0].dur-0.8)')
+        page.wait_for_function('cur===15 && !audio.paused && !loadJob',timeout=15000)
+        assert page.evaluate('audio.src')==src,'joined auto-advance changed src'
+        page.evaluate('load(14,true)')
+        page.wait_for_function('cur===14 && !loadJob && mediaReady',timeout=15000)
+    # Repeat one: the original file loops natively (no joined head wrap needed).
     page.click('#repeat');page.click('#repeat')   # none -> all -> one
     page.evaluate('state()');page.evaluate('seekSong(40)');s=page.evaluate('state()')
-    check(s,14,40,0.6,'repeat-one seek');assert s['loop'] and s['segs']==2 and s['count']==1,s
-    info=page.evaluate("""async ()=>{const b=await (await fetch(C.url)).blob();const ac=new OfflineAudioContext(2,44100,44100);
-      const ab=await ac.decodeAudioData(await b.arrayBuffer());return {dur:ab.duration,total:C.total,head:C.segs[1]}}""")
-    assert abs(info['total']-DUR)<0.1 and abs(info['dur']-DUR)<0.2 and info['head']['head'],info
-    page.evaluate(f'seekAbs(C.total-0.6)');page.wait_for_function('audio.currentTime<1 && audio.currentTime>0.2 && !audio.paused',timeout=10000)
-    assert page.evaluate('cur')==14 and abs(page.evaluate('rel()')-40.4)<1.0,page.evaluate('[cur,rel()]')
-    # Repeat all: chunk covers every song, starts at the selected one, wraps through the head part.
+    check(s,14,40,0.6,'repeat-one seek');assert s['loop'] and s['mode']=='single',s
+    page.evaluate('seekAbs(Math.max(0,(audio.duration||0)-0.6))')
+    page.wait_for_function('audio.currentTime<1 && audio.currentTime>0.05 && !audio.paused && cur===14',timeout=10000)
+    # Repeat all: when the current file ends, the following songs join (including a wrap).
     page.click('#repeat')   # one -> none
     page.click('#repeat')   # none -> all
-    s=page.evaluate('state()');assert s['loop'] and s['count']==N+2 and s['segs']==N+3 and s['first']==14,s
+    page.evaluate('seekSong(Math.max(0,(audio.duration||songs[cur].duration)-1))')
+    page.evaluate('startAudio()')
+    page.wait_for_function('C && C.loop && cur!==14 && !loadJob && mediaReady',timeout=15000)
+    s=page.evaluate('state()')
+    assert s['mode']=='join' and s['loop'] and s['count']>=2 and s['first']!=14,s
     page.evaluate('actions.pause()')
     assert not errors,errors
-    # Offline: cached v19 shell; skipping works.
+    # Offline: cached shell; skipping works.
     ctx2=browser.new_context();pg=ctx2.new_page();pg.on('pageerror',lambda e:errors.append(str(e)))
     pg.goto(url);pg.wait_for_function('window.__ready');pg.wait_for_function('navigator.serviceWorker.controller!==null',timeout=20000)
     ctx2.set_offline(True);pg.reload();pg.wait_for_function('window.__ready')
-    assert pg.locator('#ver').inner_text()=='v23'
+    assert pg.locator('#ver').inner_text()=='v24'
     small=[]
     for k in (0,1):
         out=t/f'small{k}.mp3';ff('-f','lavfi','-i',f"aevalsrc=0.5*sin(2*PI*{BASE+100*k}*t):s=44100:d=6",'-ac','2','-b:a','128k','-y',str(out));small.append(str(out))
-    pg.set_input_files('#file',small);pg.wait_for_function('songs.length===2 && cur===0 && !loadJob && C && C.count===2',timeout=60000)
+    pg.set_input_files('#file',small);pg.wait_for_function('songs.length===2 && cur===0 && !loadJob && audio.readyState>=1',timeout=60000)
     pg.evaluate(HELPERS);pg.click('#next');s=pg.evaluate('state()')
     assert s['cur']==1 and s['first']==1 and abs(s['f']-(BASE+100))<2.5,s
     ctx2.close()

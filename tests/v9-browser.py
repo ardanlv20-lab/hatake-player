@@ -30,9 +30,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
       window.__holdBuild=sessionStorage.getItem('holdBuild')==='yes';
       window.__buildGate=new Promise(resolve=>{window.__releaseBuild=()=>{window.__holdBuild=false;resolve()}});
     """)
-    assert 'async function buildChunk(i,pos=0){' in (root/'app.js').read_text(),'build gate hook no longer matches'
-    source=(root/'app.js').read_text().replace('async function buildChunk(i,pos=0){','async function buildChunk(i,pos=0){if(window.__holdBuild)await window.__buildGate;')
-    context.route('**/app.js*',lambda route:route.fulfill(status=200,content_type='text/javascript',body=source))
+    assert 'if(window.__holdBuild)await window.__buildGate;' in (root/'app.js').read_text(),'load gate hook no longer matches'
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('window.__ready')
@@ -51,7 +49,8 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.wait_for_function('cur===1 && !loadJob && Math.abs(rel()-3.25)<0.05')
     page.evaluate("""() => {
       if(document.getElementById('title').textContent!=='song-2')throw Error('Wrong loaded title');
-      if(C.segs[0].id!==songs[1].id)throw Error('Wrong chunk start');
+      if(C)throw Error('A mid-song load must use the original file, not a joined chunk');
+      if(songs[cur].id!==songs[1].id)throw Error('Wrong song loaded');
     }""")
     # Metadata is already present: no new loadedmetadata event should be necessary.
     assert page.evaluate('restorePosition(2.5,null)')
@@ -81,7 +80,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     }""")
     page.wait_for_function('window.__ready && !loadJob && !audio.paused')
     page.evaluate("""() => {
-      if(building!==restoreGeneration||cur!==1||C.segs[0].id!==songs[1].id)throw Error('Wrong restore won');
+      if(building!==restoreGeneration||cur!==1||C)throw Error('Wrong restore won');
       if(playCalls.length!==1||playCalls[0].time<3.2||playCalls[0].title!=='song-2')throw Error('Play happened before seek');
       if(!playCalls[0].src||Math.abs(rel()-3.25)>0.8)throw Error('Wrong playback position');
       const src=audio.src;actions.pause();if(audio.src!==src)throw Error('Pause cleared source');
@@ -125,16 +124,16 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.evaluate('() => { load(0,false) }')
     page.wait_for_function('cur===0 && !loadJob && audio.readyState>=1', timeout=30000)
     page.evaluate("""async () => {
-      if(!C||!urlNow||!audio.getAttribute('src'))throw Error('Expected loaded chunk');
+      if(C||!urlNow||!audio.getAttribute('src'))throw Error('Expected the original file to stay loaded');
       const oldConfirm=window.confirm;window.confirm=()=>true;
       while(songs.length>1)await del(songs.length-1);
-      if(cur!==0||!C||!urlNow)throw Error('Deleting other songs cleared the current track');
+      if(cur!==0||C||!urlNow)throw Error('Deleting other songs cleared the current track');
       await del(0);
       window.confirm=oldConfirm;
       if(C||urlNow||audio.getAttribute('src')||cur!==-1)throw Error('Last-song delete leaked playback: C='+!!C+' urlNow='+!!urlNow+' src='+audio.getAttribute('src')+' cur='+cur);
       if(document.getElementById('title').textContent!=='曲を追加してください')throw Error('Wrong empty title');
     }""")
-    assert page.locator('#ver').inner_text()=='v23'
+    assert page.locator('#ver').inner_text()=='v24'
     assert not errors,errors
     print('PASS v16: idle startup, no idle-add autoload, last-song cleanup, metadata-already-ready seek, early play stays queued, no recovery/cancellation, seek-before-first-play, queue cancellation, newer-load ownership, retained src, no page errors')
     browser.close()

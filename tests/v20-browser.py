@@ -31,7 +31,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.on('console',lambda m: (m.type=='error') and errors.append('console:'+m.text))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v23'
+    assert page.locator('#ver').inner_text()=='v24'
 
     # The exact user-facing English string must never be returned by playErrorMessage.
     hidden=page.evaluate("""(s)=>{
@@ -87,9 +87,9 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
 
     # Play one, then tap a DIFFERENT song while it would still be playing (the user report).
     s=load_ok(0,True,'first')
-    assert s['C'] and s['C']['count']>=2,s
+    assert s['C'] is None,('list tap must be the original file',s)
     s=load_ok(10,True,'tap-while-playing')
-    assert s['C'] and s['C']['first']==10,s
+    assert s['C'] is None and s['cur']==10,('tap while playing must be the original file of song 10',s)
     print('tap-while-playing',s['msg'])
 
     # Rapid taps on a 70+ song library: stale buildChunks must abort; last tap wins.

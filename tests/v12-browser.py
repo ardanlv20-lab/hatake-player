@@ -34,6 +34,8 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.goto(url);page.wait_for_function('window.__ready')
     page.set_input_files('#file',files)
     page.wait_for_function('songs.length===3 && cur===0 && !loadJob && audio.readyState>=1')
+    page.evaluate("()=>load(0,false,0,'join')")
+    page.wait_for_function('C && C.segs.length===3 && !loadJob')
     page.evaluate("""async () => {
       const modes=[];
       for(const song of songs){const b=await tx('blobs','readonly',s=>s.get(song.id));modes.push(parseMp3(new Uint8Array(b.buf)).mode)}
@@ -66,7 +68,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     assert page.evaluate("sessionStorage.getItem('boots')")=='1'
     page.evaluate("""async () => {
       if(audio.src!==src||!audio.paused)throw Error('Update lost paused remote-control source');
-      S.repeat='all';order=[2,0,1];await load(0,false);
+      S.repeat='all';order=[2,0,1];await load(0,false,0,'join');
       if(!C.loop||!audio.loop||C.segs.map(g=>g.i).join()!=='0,1,2')throw Error('Shuffled repeat did not build one native loop');
       updateProgress=()=>{};await startAudio();stopTicker();
       src=audio.src;calls=playCalls;reads=dbCalls;seekAbs(audio.duration-0.25);
@@ -75,7 +77,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.evaluate("""async () => {
       if(audio.src!==src||playCalls!==calls||dbCalls!==reads)throw Error('All-repeat needed JS handoff');
       pausePlayback();S.repeat='one';makeOrder();await load(1,false);
-      if(C.segs.length!==1||C.segs[0].i!==1||!C.loop||!audio.loop)throw Error('One-repeat still depends on segment timer');
+      if(C||!audio.loop||cur!==1)throw Error('One-repeat should use the original file with native loop');
       await startAudio();stopTicker();src=audio.src;calls=playCalls;reads=dbCalls;seekAbs(audio.duration-0.25);
     }""")
     page.wait_for_function('audio.currentTime<1 && !audio.paused')
@@ -99,7 +101,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
       songs=[{id:'large-a',title:'large A',duration:parsed.dur*count},
              {id:'large-b',title:'large B',duration:parsed.dur*count},tail];
       S.repeat='none';S.shuffle=false;makeOrder();
-      if(!await load(0,false))throw Error('Large joined stream failed to load');
+      if(!await load(0,false,0,'join'))throw Error('Large joined stream failed to load');
       if(C.segs.length!==3)throw Error('Playlist still split at 150MiB');
       const blob=await (await fetch(audio.src)).blob();
       if(blob.size<=150*1048576)throw Error('Large fixture did not cross former cap');

@@ -28,6 +28,8 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
         page.on('pageerror',lambda e:errors.append(str(e)))
         page.goto(url);page.wait_for_function('window.__ready')
         page.set_input_files('#file',files)
+        page.wait_for_function('songs.length===3 && cur===0 && !loadJob && audio.readyState>=1')
+        page.evaluate("()=>load(0,false,0,'join')")
         page.wait_for_function('C && C.segs.length===3 && audio.readyState>=1')
         info=page.evaluate("""async () => {
           const buf=new Uint8Array(await (await fetch(audio.src)).arrayBuffer());

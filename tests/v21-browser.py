@@ -60,7 +60,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page=browser.new_context(service_workers='block').new_page()
     page.on('dialog',lambda d:d.accept())
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v23'
+    assert page.locator('#ver').inner_text()=='v24'
 
     items=[[f'id{i}',name,list(data),'audio/mpeg' if fmt=='mp3' else 'audio/mp4'] for i,(name,f0,fmt,data) in enumerate(raws)]
     page.evaluate("""async (items)=>{
@@ -98,7 +98,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
 
     # --- shuffle OFF, repeat OFF: tap every title while the previous is playing ---
     s=tap(0,'first')
-    assert s['mode']=='join' and s['count']>=2,s
+    assert s['mode']=='single',('list tap must play the original file',s)
     print('first',s)
     for i in range(1,len(expect)):
         s=tap(i,'tap-while-playing-'+expect[i]['title'])
