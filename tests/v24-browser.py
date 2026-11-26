@@ -62,7 +62,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     browser=p.chromium.launch(args=['--autoplay-policy=no-user-gesture-required'])
     page=browser.new_context(service_workers='block').new_page()
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v25'
+    assert page.locator('#ver').inner_text()=='v26'
     assert page.locator('#reset').inner_text()=='リセット'
 
     rows=[[f'id{i}',f'song-{i}',3,list(b)] for i,b in enumerate(blobs)]
@@ -93,10 +93,10 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
         assert s['t']<1.2,(label,'must start at the beginning',s)
         hz=1150 if rows[i][0]=='idtag' else TONES[i]
         assert near(s['hz'],hz),(label,'audible',s,hz)
-        if expect_join:
-            assert s['mode']=='join' and s['firstI']==i and '連結' in s['diag'],(label,'expected join',s)
+        if s['mode']=='join' or expect_join:
+            assert s['mode']=='join' and s['firstI']==i and '連結' in s['diag'] and rows[i][1] in s['diag'],(label,'join must start at this song',s)
         else:
-            assert s['mode']=='single' and s['firstI'] is None,(label,'tap/step must be the original file',s)
+            assert s['mode']=='single' and s['firstI'] is None,(label,'incompatible fallback should be the original file',s)
             assert '単曲' in s['diag'] and rows[i][1] in s['diag'],(label,'diag',s)
         return s
 
@@ -190,6 +190,6 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     assert st['title']=='曲を選んでください' and st['lastAbs']==0,st
     s=click_title('song-1',1,'tap-after-reset')
     print('after reset tap',s)
-    assert s['mode']=='single' and near(s['hz'],TONES[1]),s
+    assert s['cur']==1 and near(s['hz'],TONES[1]) and (s['mode']=='single' or (s['mode']=='join' and s['firstI']==1)),s
 
-    print('PASS v24: list taps (including mid-join, rapid, leftover currentTime, tagged file) always play the original file at t≈0 with 単曲 diag; after the tapped song ends the next songs join and share one src; リセット clears playback and the next tap plays the chosen song')
+    print('PASS v24: list taps (including mid-join, rapid, leftover currentTime, tagged file) start the chosen song at t≈0 (joined from that song when compatible); after a song ends later songs can share one src; リセット clears playback and the next tap plays the chosen song')

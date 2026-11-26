@@ -122,7 +122,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     browser=p.chromium.launch(args=['--autoplay-policy=no-user-gesture-required'])
     page=browser.new_context(service_workers='block').new_page()
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v25'
+    assert page.locator('#ver').inner_text()=='v26'
 
     page.evaluate("""async (rows)=>{
       S.shuffle=false;S.repeat='none';save();ui();
@@ -205,7 +205,9 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.wait_for_timeout(700)
     s2=click_title('すなあそび',2,'retry-b-suna')
     print('retry B',s2)
-    assert s1['id']=='id2' and s2['id']=='id2' and s1['mode']=='single' and s2['mode']=='single',(s1,s2)
+    assert s1['id']=='id2' and s2['id']=='id2' and s1['t']<1.2 and s2['t']<1.2,(s1,s2)
+    for s in (s1,s2):
+        assert s['mode']=='single' or (s['mode']=='join' and s['firstI']==2 and s['segI']==2),(s1,s2)
     if s1['hz'] is not None: assert near(s1['hz'],800),s1
     if s2['hz'] is not None: assert near(s2['hz'],800),s2
 
@@ -274,7 +276,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.wait_for_function("!loadJob && mediaReady && songs[cur] && songs[cur].id==='id2'",timeout=30000)
     s=page.evaluate(HZ)
     print('after delete',s)
-    assert s['id']=='id2' and s['mode']=='single' and s['t']<1.2,s
+    assert s['id']=='id2' and s['t']<1.2 and (s['mode']=='single' or (s['mode']=='join' and s['firstI']==s['cur'])),s
     if s['hz'] is not None: assert near(s['hz'],800),s
 
     print('PASS v23: tagged MP3 fixtures parse as their own 4s audio, list taps (including すなあそび / ミラフル-- / プリンセスモード and a duplicate title) always play the tapped file\'s tone at t≈0 after different prior songs, leftover currentTime, stale lastAbs/prefetch, and a mid-list delete')

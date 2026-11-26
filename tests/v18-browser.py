@@ -59,7 +59,7 @@ def run_suite(browser_type, label):
         page=context.new_page();errors=[]
         page.on('pageerror',lambda e:errors.append(str(e)))
         page.goto(url);page.wait_for_function('window.__ready')
-        assert page.locator('#ver').inner_text()=='v25'
+        assert page.locator('#ver').inner_text()=='v26'
         assert page.locator('#cancel').is_hidden()
         page.evaluate(HOOK)
 

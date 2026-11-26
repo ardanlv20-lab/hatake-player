@@ -124,16 +124,17 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.evaluate('() => { load(0,false) }')
     page.wait_for_function('cur===0 && !loadJob && audio.readyState>=1', timeout=30000)
     page.evaluate("""async () => {
-      if(C||!urlNow||!audio.getAttribute('src'))throw Error('Expected the original file to stay loaded');
+      if(!urlNow||!audio.getAttribute('src')||cur!==0)throw Error('Current song was not loaded');
+      if(C&&C.segs[0].i!==0)throw Error('Joined load did not start at song 0');
       const oldConfirm=window.confirm;window.confirm=()=>true;
       while(songs.length>1)await del(songs.length-1);
-      if(cur!==0||C||!urlNow)throw Error('Deleting other songs cleared the current track');
+      if(cur!==0||!urlNow)throw Error('Deleting other songs cleared the current track');
       await del(0);
       window.confirm=oldConfirm;
       if(C||urlNow||audio.getAttribute('src')||cur!==-1)throw Error('Last-song delete leaked playback: C='+!!C+' urlNow='+!!urlNow+' src='+audio.getAttribute('src')+' cur='+cur);
       if(document.getElementById('title').textContent!=='曲を追加してください')throw Error('Wrong empty title');
     }""")
-    assert page.locator('#ver').inner_text()=='v25'
+    assert page.locator('#ver').inner_text()=='v26'
     assert not errors,errors
     print('PASS v16: idle startup, no idle-add autoload, last-song cleanup, metadata-already-ready seek, early play stays queued, no recovery/cancellation, seek-before-first-play, queue cancellation, newer-load ownership, retained src, no page errors')
     browser.close()

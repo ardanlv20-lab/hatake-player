@@ -34,7 +34,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v25'
+    assert page.locator('#ver').inner_text()=='v26'
 
     # iOS-like library: m4a and wav stored as audio/mpeg (picker often lies); mixed rates/channels.
     items=[
@@ -68,10 +68,10 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
         if play: assert s['paused'] is False,(label,'expected playing',s)
         return s
 
-    # First song: a list tap plays the original file (not a joined chunk).
+    # First two 44.1k 192k CBR songs join; the tap starts that chunk at song 0.
     s=load_ok(0,True,'first')
-    assert s['C'] is None,('tap must be single-file',s)
-    assert '単曲' in (s['msg'] or '') or '単曲' in page.locator('#diag').inner_text(),s
+    assert s['C'] and s['C']['first']==0 and s['C']['count']>=2,('tap should start a joined chunk at song 0',s)
+    assert '連結' in (s['msg'] or '') or '連結' in page.locator('#diag').inner_text(),s
     n=page.evaluate("async ()=>{const ch=await buildChunk(0,0);const n=ch&&ch.count;if(ch&&ch.url)revokeUnused(ch.url);return n||0}")
     assert n>=2,('the two 44.1k stereo MP3s should still be joinable afterwards',n)
     page.wait_for_timeout(200)
@@ -82,7 +82,8 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
         print('tap',title,s['msg'],'C',s['C'])
         if title in ('m4a-lying','wav-lying','m4a-ok'):
             assert s['C'] is None,('must not treat non-MP3 as a joined stream',title,s)
-        assert s['C'] is None,('a list tap always plays the original file',title,s)
+        elif s['C']:
+            assert s['C']['first']==i,('a joined tap must start at the tapped song',title,s)
 
     # Backward, paused, then play another, then skip buttons.
     load_ok(5,False,'paused-wav')
@@ -112,13 +113,13 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.wait_for_function("!document.getElementById('convert').disabled && "+MSG+".includes('そろえました')",timeout=120000)
     print('after convert',page.evaluate(MSG))
     s=load_ok(0,True,'after-convert-0')
-    assert s['C'] is None,s
+    assert s['C'] and s['C']['first']==0 and s['C']['count']==8,s
     n=page.evaluate("async ()=>{const ch=await buildChunk(0,0);const n=ch&&ch.count;if(ch&&ch.url)revokeUnused(ch.url);return n||0}")
-    assert n>=7,('same-CBR converted songs should join (a leftover 128k target MP3 may split the last song)',n)
+    assert n==8,('all 8 songs should be 192k CBR and join after convert',n)
     for i in (2,5,7,1):
         load_ok(i,True,'post-convert-'+str(i))
     assert page.evaluate("songs.every(s=>true)")  # still 8
     assert errors==[] or all('Service Worker' in e for e in errors),errors
-    print('PASS v19: mislabeled m4a/wav no longer show 音楽ファイルを読み込めませんでした, every list tap plays (mix of 44.1k/48k/mono/m4a/wav, playing/paused/next/prev), taps are single-file, 44.1k songs remain joinable after the current song, sniffType fixes MIME, convert then tap still works')
+    print('PASS v19: mislabeled m4a/wav no longer show 音楽ファイルを読み込めませんでした, every list tap plays (mix of 44.1k/48k/mono/m4a/wav, playing/paused/next/prev), compatible taps start a join at the tapped song, sniffType fixes MIME, convert then all 8 join')
     browser.close()
 server.shutdown()

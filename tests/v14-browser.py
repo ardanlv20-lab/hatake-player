@@ -31,7 +31,7 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page=context.new_page();errors=[]
     page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('window.__ready')
-    assert page.locator('#ver').inner_text()=='v25'
+    assert page.locator('#ver').inner_text()=='v26'
     assert page.locator('#convert').inner_text()=='形式と音量をそろえる'
     assert page.evaluate("getComputedStyle(document.getElementById('convert')).minHeight")=='64px'
     # Encoder output: 44.1kHz MPEG-1, 2ch never mono; record lamejs channel mode.
@@ -102,14 +102,14 @@ with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
     page.wait_for_function("!document.getElementById('convert').disabled && "+MSG+".includes('曲を44.1kHzステレオのMP3にそろえました')",timeout=60000)
     page.evaluate("load(0,false)")
     page.wait_for_function("!loadJob && cur===0 && audio.readyState>=1",timeout=20000)
-    assert page.evaluate('!C'),'a list/select load must be the original file, not a joined chunk'
+    assert page.evaluate('C && C.count===11 && C.segs[0].i===0'),'after convert, a select starts a 11-song joined chunk at song 0'
     n=page.evaluate("async ()=>{const ch=await buildChunk(0,0);const n=ch&&ch.count;if(ch&&ch.url)revokeUnused(ch.url);return n||0}")
     assert n==11,('all 11 songs should be joinable',n)
     # Offline: encoder from SW cache; normalizes a 48k MP3.
     ctx2=browser.new_context();pg=ctx2.new_page();pg.on('pageerror',lambda e:errors.append(str(e)))
     pg.goto(url);pg.wait_for_function('window.__ready');pg.wait_for_function('navigator.serviceWorker.controller!==null',timeout=20000)
     ctx2.set_offline(True);pg.reload();pg.wait_for_function('window.__ready')
-    assert pg.locator('#ver').inner_text()=='v25'
+    assert pg.locator('#ver').inner_text()=='v26'
     pg.set_input_files('#file',[s48,s44])
     pg.wait_for_function("songs.length===2 && cur===0 && !loadJob && "+MSG+".includes('曲を取り込みました')",timeout=60000)
     assert '形式と音量をそろえる' in pg.evaluate(MSG)

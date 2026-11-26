@@ -94,12 +94,15 @@ function isMp3(u){
  const p=skipId3(u,0),end=stripTail(u,u.length);
  return (r.end-r.start)>=0.5*(end-p);
 }
-// Target format for the whole library: MPEG-1 Layer III, 44100 Hz, 2 channels.
+// Target format for the whole library: MPEG-1 Layer III, 44100 Hz, stereo, 192kbps CBR.
+// Matching this lets a list tap start a joined 12-song stream for background playback.
 const TARGET_SR=44100;
+const TARGET_BR=192000;
 // True for MP3 bytes already in the target format (these are never re-encoded).
 function isTargetMp3(u){
  if(!isMp3(u))return false;
- const r=parseMp3(u);return !!r&&r.sr===TARGET_SR&&r.v===3&&r.mode!==3;
+ const r=parseMp3(u);
+ return !!r&&r.sr===TARGET_SR&&r.v===3&&r.mode!==3&&r.cbr&&r.br===TARGET_BR;
 }
 // MIME from the file picker is untrusted (iOS often reports m4a as audio/mpeg).
 // Bytes decide: only real MP3s are joined; other files get a type the player can use.
@@ -407,7 +410,7 @@ async function processMp3Segments(ctx,u,parsed,{format,loud},onPct){
  if(onPct)await onPct('encode',100);
  const mm=enc.flush();if(mm.length)chunks.push(new Uint8Array(mm.buffer,mm.byteOffset,mm.length));
  const buf=await new Blob(chunks,{type:'audio/mpeg'}).arrayBuffer();chunks.length=0;
- if(!isTargetMp3(new Uint8Array(buf)))throw new Error('変換結果が44.1kHzステレオのMP3になりませんでした');
+ if(!isTargetMp3(new Uint8Array(buf)))throw new Error('変換結果が44.1kHzステレオ192kbps CBRのMP3になりませんでした');
  return{buf,lufs:m.lufs,peakDb:m.peakDb,gainDb};
 }
 // Decode, optionally measure loudness, and encode a 192kbps 44.1kHz stereo MP3 with the
@@ -437,7 +440,7 @@ async function processAudio(raw,{format=true,loud=true}={},onPct){
  if(part.own){const mm=part.enc.flush();if(mm.length)part.out.push(new Uint8Array(mm.buffer,mm.byteOffset,mm.length))}
  L=R=null;
  const buf=await new Blob(part.out,{type:'audio/mpeg'}).arrayBuffer();part.out.length=0;
- if(!isTargetMp3(new Uint8Array(buf)))throw new Error('変換結果が44.1kHzステレオのMP3になりませんでした');
+ if(!isTargetMp3(new Uint8Array(buf)))throw new Error('変換結果が44.1kHzステレオ192kbps CBRのMP3になりませんでした');
  return{buf,lufs:m.lufs,peakDb:m.peakDb,gainDb};
 }
 async function toMp3(raw,onPct){return (await processAudio(raw,{format:true,loud:false},(k,p)=>onPct&&onPct(p))).buf}
@@ -553,7 +556,7 @@ async function del(i){
   if('mediaSession' in navigator){try{navigator.mediaSession.metadata=null}catch(e){}}
   cur=-1;lastAbs=0;if(songs.length)await load(Math.min(i,songs.length-1),false);else{idleScreen();ui()}}
  else if(i<cur)cur--;
- makeOrder();render();usage();dropPre();if(C&&!wasCur)rebuild();else prefetch();
+ makeOrder();render();usage();dropPre();if(C&&!wasCur)await rebuild();else prefetch();
 }
 function loadById(id,play=false,pos=0){
  const i=songs.findIndex(x=>x.id===id);
@@ -810,7 +813,24 @@ function mediaLive(el){
 function showDiag(s,kind){
  const el=$('diag');if(!el)return;
  if(!s){el.textContent='';return}
- el.textContent='再生中: '+s.title+'（'+(kind==='join'?'連結':'単曲')+'）';
+ if(kind==='join'||((kind==null||kind==='join')&&C)){
+  el.textContent='再生中: '+s.title+'（連結 '+(C&&C.count||0)+'曲）';
+ }else if(kind==='unaligned'){
+  el.textContent='再生中: '+s.title+'（単曲・形式未統一）';
+ }else{
+  el.textContent='再生中: '+s.title+'（単曲）';
+ }
+}
+function singleFallbackKind(){
+ if(S.repeat==='one'||songs.length<=1)return 'single';
+ const i=curIdx();if(i<0)return 'single';
+ const s=songs[i],cached=s&&parseCache.get(s.id),r=cached&&cached.r;
+ // VBR / unparsable files cannot start a joined stream, even as the last track.
+ if(!r||!r.cbr||!r.br)return 'unaligned';
+ const k=order.indexOf(i);
+ if(k>=0&&k<order.length-1)return 'unaligned';
+ if(S.repeat==='all'&&order.length>1)return 'unaligned';
+ return 'single';
 }
 let nextJoin=null;
 function dropNextJoin(){
@@ -866,9 +886,23 @@ function swapAudio(){
  dropPre();dropNextJoin();
  return el;
 }
+function followingJoinIdx(){
+ // Next song after the current joined chunk (or after the current single file).
+ // Must not call nextIdx() here: that reshuffles pendingOrder on a repeat-all wrap.
+ if(C){
+  const last=C.segs[C.segs.length-1].i,k=order.indexOf(last)+1;
+  if(k<order.length)return order[k];
+  if(S.repeat==='all'&&order.length){
+   if(C.loop&&C.count===order.length)return -1;
+   return order[0];
+  }
+  return -1;
+ }
+ return nextIdx();
+}
 async function prepareNextJoin(){
- if(C||S.repeat==='one'||userPaused||loadJob)return;
- const n=nextIdx();if(n<0)return;
+ if(S.repeat==='one'||userPaused||loadJob)return;
+ const n=followingJoinIdx();if(n<0)return;
  const id=songs[n].id;
  if(nextJoin&&nextJoin.id===id&&(nextJoin.ch||nextJoin.pending))return;
  dropNextJoin();
@@ -1065,11 +1099,14 @@ async function singleUrl(id,i){
 async function load(i,play=false,pos=0,how){
  if(i<0||i>=songs.length)return false;
  pos=Math.max(0,pos||0);
- // 'single' (list tap / default at offset 0): the song's own file, never a joined chunk, never a seek.
- // 'step': same, but keep the current <audio> (lock-screen next/prev may not get a new-element gesture).
+ // 'tap' (list tap / default at offset 0): swap <audio>, play a joined chunk that
+ //   starts at this song at offset 0 (so the tapped title is heard from the start,
+ //   and later songs are already in the same stream for background playback).
+ // 'step': same join, but keep the current <audio> (lock-screen next/prev).
  // 'seek': the song's own file at a position (seek bar / restore). Safe: the file is short.
- // 'join': unattended only — a joined chunk that starts at this (following) song at offset 0.
- if(!how)how=pos>0?'seek':'single';
+ // 'join': unattended ended — keep <audio>, joined chunk starting at this song at 0.
+ // 'single': force the original file (repeat-one). Fallback also uses this path.
+ if(!how)how=pos>0?'seek':'tap';
  const previous=loadJob,my=++building;
  if(previous&&previous.cancel)previous.cancel();
  const job=loadJob={generation:my,id:songs[i].id,pos,how,cancel:null};
@@ -1079,8 +1116,9 @@ async function load(i,play=false,pos=0,how){
  if(play){wantPlay=true;userPaused=false}
  stopTicker();clearTimeout(pauseTimer);
  $('title').textContent=songs[i].title;msg('読み込み中…');
- const swap=how==='single'&&pos===0;
- const reuse=how==='join'&&pos===0&&nextJoin&&nextJoin.id===job.id&&nextJoin.ch?nextJoin:null;
+ const swap=(how==='tap'||how==='single')&&pos===0;
+ const tryJoin=pos===0&&how!=='seek'&&how!=='single';
+ const reuse=tryJoin&&nextJoin&&nextJoin.id===job.id&&nextJoin.ch?nextJoin:null;
  if(reuse)nextJoin=null;else dropNextJoin();
  if(swap){
   lastAbs=0;
@@ -1099,11 +1137,11 @@ async function load(i,play=false,pos=0,how){
  if(loadJob!==job)return false;
  let ch=null;
  try{
-  if(how==='join'&&pos===0){
+  if(tryJoin){
    if(reuse&&reuse.ch)ch=reuse.ch;
    else{try{ch=await buildChunk(i,0,my)}catch(e){console.warn(e);ch=null}}
    if(loadJob!==job){if(ch)revokeUnused(ch.url);return false}
-   if(ch&&!chunkLooksLikeSong(ch,job,0)){console.warn('chunk does not start as the next song');revokeUnused(ch.url);ch=null}
+   if(ch&&!chunkLooksLikeSong(ch,job,0)){console.warn('chunk does not start at the selected song');revokeUnused(ch.url);ch=null}
   }
   let url,ok=false,err=null;
   if(ch){
@@ -1164,8 +1202,11 @@ async function load(i,play=false,pos=0,how){
   lastAbs=audio.currentTime||0;freshStart=ch?performance.now():0;
   mediaReady=true;loadJob=null;
   S.lastId=songs[cur].id;S.lastPos=rel();lastSave=Date.now();save();updateProgress();
-  showDiag(songs[cur],ch?'join':'single');
-  msg(ch?'連続再生モード（'+ch.count+'曲をつなげて再生中）':'単曲再生（この曲のファイルを再生中）');
+  const kind=ch?'join':singleFallbackKind();
+  showDiag(songs[cur],kind);
+  msg(ch?'連続再生モード（'+ch.count+'曲をつなげて再生中）':
+   kind==='unaligned'?'単曲再生（形式やビットレートが違うため、この曲だけを再生中。「形式と音量をそろえる」を使うと、画面を閉じても続けて再生しやすくなります）':
+   '単曲再生（この曲のファイルを再生中）');
   if(!ch){const g=building;setTimeout(()=>{if(g===building&&!loadJob)prefetch()},0)}
   if(wantPlay&&!initializing){wantPlay=false;startAudio()}
   return true;
@@ -1178,8 +1219,8 @@ async function load(i,play=false,pos=0,how){
 function curIdx(){if(loadJob){const n=songs.findIndex(x=>x.id===loadJob.id);if(n>=0)return n}return cur}
 function curPos(){return loadJob?loadJob.pos:rel()}
 const playingNow=()=>!audio.paused||wantPlay;
-// Next/prev (buttons and lock screen) play that song's original file at offset 0.
-// Joining of what follows starts when that file ends.
+// Next/prev (buttons and lock screen) start a joined chunk at that song (offset 0),
+// keeping the current <audio> so iOS media-session play() still works.
 function step(d){
  if(!songs.length)return;
  const c=curIdx();
@@ -1359,6 +1400,10 @@ function updateProgress(){
   const rem=audio.duration-t;
   if(!userPaused&&audio.duration>2&&rem>0&&rem<6)prepareNextJoin();
  }
+ if(C){
+  const rem=C.total-(audio.currentTime||0);
+  if(!userPaused&&C.total>2&&rem>0&&rem<6)prepareNextJoin();
+ }
  posState(); // Every tick; only persistence is throttled.
  persistPos(false)
 }
@@ -1378,7 +1423,7 @@ window.addEventListener('pageshow',wakeDB);
 window.addEventListener('focus',wakeDB);
 
 
-const APP_VERSION='v25';
+const APP_VERSION='v26';
 $('update').onclick=async()=>{
  if(!confirm('アプリを最新版に更新します（曲は消えません）。よろしいですか？'))return;
  msg('更新中…');
